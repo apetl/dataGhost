@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/goccy/go-yaml"
 	"golang.org/x/crypto/blake2b"
-	"gopkg.in/yaml.v3"
 )
 
 type fileData struct {
@@ -54,16 +54,14 @@ func writeMetadataToYAML(filePath string, hash string, yamlPath string) error {
 		},
 	}
 
-	file, err := os.Create(yamlPath)
+	yamlBytes, err := yaml.Marshal(data)
 	if err != nil {
-		return fmt.Errorf("failed to create file: %w", err)
+		return fmt.Errorf("failed to marshal YAML: %w", err)
 	}
-	defer file.Close()
 
-	encoder := yaml.NewEncoder(file)
-	err = encoder.Encode(data)
+	err = os.WriteFile(yamlPath, yamlBytes, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to encode YAML: %w", err)
+		return fmt.Errorf("failed to write file: %w", err)
 	}
 
 	return nil
