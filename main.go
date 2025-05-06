@@ -114,17 +114,25 @@ func addF(filePath string, tracePath string) error {
 		return err
 	}
 
-	if isInTrace && !hashesMatch {
-		fmt.Printf("\033[33mWarning:\033[0m File '%s' already exists in trace with a different hash.\n", filename)
-		fmt.Printf("Existing hash: %s\n", storedHash)
-		fmt.Printf("New hash: %s\n", currentHash)
-		fmt.Print("Do you want to overwrite it? (y/n): ")
+	if isInTrace {
+		if hashesMatch {
+			fmt.Printf("\033[36mFilename:\033[0m %s\n", filename)
+			fmt.Printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
+			fmt.Printf("\033[36mStored hash:\033[0m %s\n", storedHash)
+			fmt.Println("\033[32mStatus: Hashes match ✓\033[0m")
+			return nil
+		} else {
+			fmt.Printf("\033[33mWarning:\033[0m File '%s' already exists in trace with a different hash.\n", filename)
+			fmt.Printf("Existing hash: %s\n", storedHash)
+			fmt.Printf("New hash: %s\n", currentHash)
+			fmt.Print("Do you want to overwrite it? (y/n): ")
 
-		var response string
-		fmt.Scanln(&response)
+			var response string
+			fmt.Scanln(&response)
 
-		if response != "y" && response != "Y" {
-			return fmt.Errorf("operation cancelled by user")
+			if response != "y" && response != "Y" {
+				return fmt.Errorf("operation cancelled by user")
+			}
 		}
 	}
 
@@ -137,10 +145,9 @@ func addF(filePath string, tracePath string) error {
 		Blake2b: currentHash,
 	}
 
-	hash, _ := calcHash(filePath)
 	fmt.Printf("\033[32mFile Added to Trace:\033[0m\n")
 	fmt.Printf("\033[36mFilename:\033[0m %s\n", filename)
-	fmt.Printf("\033[36mBlake2b Hash:\033[0m %s\n", hash)
+	fmt.Printf("\033[36mBlake2b Hash:\033[0m %s\n", currentHash)
 
 	return writeTrace(data, tracePath)
 }
