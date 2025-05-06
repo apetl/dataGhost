@@ -2,3 +2,4 @@
 *.trace
 
 /bin
+/test
