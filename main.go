@@ -165,6 +165,10 @@ func add(path string) error {
 				return nil
 			}
 
+			if filepath.Base(filePath) == ".trace" {
+				return nil
+			}
+
 			return addF(filePath, dirTracePath)
 		})
 
@@ -226,7 +230,7 @@ func del(path string) error {
 		}
 
 		for _, file := range files {
-			if !file.IsDir() {
+			if !file.IsDir() && file.Name() != ".trace" {
 				err := delF(file.Name(), dirTracePath)
 				if err != nil {
 					fmt.Printf("\033[33mWarning:\033[0m %v\n", err)
@@ -295,6 +299,11 @@ func check(path string) error {
 			}
 
 			if d.IsDir() {
+				return nil
+			}
+
+			// Skip .trace file itself
+			if filepath.Base(filePath) == ".trace" {
 				return nil
 			}
 
