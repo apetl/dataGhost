@@ -375,21 +375,102 @@ func check(path string, recursive bool) error {
 	return checkF(path, fileGhostPath)
 }
 
+func cleanF(dirPath string, ghostPath string) error {
+	data, err := readGhost(ghostPath)
+	if err != nil {
+		return fmt.Errorf("failed to read ghost file: %w", err)
+	}
+
+	if len(data) == 0 {
+		fmt.Printf("\033[36mGhost file is empty at:\033[0m %s\n", ghostPath)
+		return nil
+	}
+
+	removedCount := 0
+	for filename := range data {
+		filePath := filepath.Join(dirPath, filename)
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			fmt.Printf("\033[33mMissing file:\033[0m %s\n", filename)
+			delete(data, filename)
+			removedCount++
+		}
+	}
+
+	if removedCount > 0 {
+		fmt.Printf("\033[32mRemoved %d missing file(s) from ghost\033[0m\n", removedCount)
+		return writeGhost(data, ghostPath)
+	}
+
+	fmt.Printf("\033[32mNo missing files found in ghost\033[0m\n")
+	return nil
+}
+
+func clean(path string, recursive bool) error {
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("failed to access path: %w", err)
+	}
+
+	if fileInfo.IsDir() {
+		fmt.Printf("\033[36mCleaning directory:\033[0m %s\n", path)
+		dirGhostPath := filepath.Join(path, ".ghost")
+
+		if _, err := os.Stat(dirGhostPath); !os.IsNotExist(err) {
+			if err := cleanF(path, dirGhostPath); err != nil {
+				return fmt.Errorf("error cleaning ghost file: %w", err)
+			}
+		} else {
+			fmt.Printf("\033[33mNo ghost file found at:\033[0m %s\n", dirGhostPath)
+		}
+
+		if recursive {
+			err := filepath.WalkDir(path, func(subPath string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+
+				if d.IsDir() && subPath != path {
+					subGhostPath := filepath.Join(subPath, ".ghost")
+					if _, err := os.Stat(subGhostPath); !os.IsNotExist(err) {
+						if err := cleanF(subPath, subGhostPath); err != nil {
+							fmt.Printf("\033[31mError cleaning %s: %v\033[0m\n", subPath, err)
+						}
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return fmt.Errorf("error processing directory recursively: %w", err)
+			}
+		}
+		return nil
+	}
+
+	dirPath := filepath.Dir(path)
+	fileGhostPath := filepath.Join(dirPath, ".ghost")
+
+	if _, err := os.Stat(fileGhostPath); os.IsNotExist(err) {
+		return fmt.Errorf("no ghost file found in directory: %s", dirPath)
+	}
+
+	return cleanF(dirPath, fileGhostPath)
+}
+
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Println("Error: Please provide a command (add/del/check) and a file or directory path.")
-		fmt.Println("Usage: program add|del|check [-r] filepath")
+	if len(os.Args) < 2 {
+		fmt.Println("Error: Please provide a command (add/del/check/clean) and a file or directory path.")
+		fmt.Println("Usage: program add|del|check|clean [-r] [filepath]")
 		fmt.Println("  -r: Process directories recursively")
 		os.Exit(1)
 	}
 
 	var command, path string
 	recursive := false
-
 	argIndex := 1
+
 	if os.Args[1] == "-r" {
-		if len(os.Args) < 4 {
-			fmt.Println("Error: Missing command or path after -r flag")
+		if len(os.Args) < 3 {
+			fmt.Println("Error: Missing command after -r flag")
 			os.Exit(1)
 		}
 		recursive = true
@@ -397,7 +478,15 @@ func main() {
 	}
 
 	command = os.Args[argIndex]
-	path = os.Args[argIndex+1]
+
+	if command == "clean" && len(os.Args) <= argIndex+1 {
+		path = "."
+	} else if len(os.Args) <= argIndex+1 {
+		fmt.Printf("Error: Missing path for command: %s\n", command)
+		os.Exit(1)
+	} else {
+		path = os.Args[argIndex+1]
+	}
 
 	var err error
 
@@ -408,6 +497,8 @@ func main() {
 		err = del(path, recursive)
 	case "check":
 		err = check(path, recursive)
+	case "clean":
+		err = clean(path, recursive)
 	default:
 		fmt.Printf("Unknown command: %s\n", command)
 		os.Exit(1)
@@ -418,4 +509,3 @@ func main() {
 		os.Exit(1)
 	}
 }
-
