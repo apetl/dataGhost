@@ -46,13 +46,13 @@ func calcHash(path string) (string, error) {
 	return fmt.Sprintf("%x", hashSum), nil
 }
 
-func compare(filename string, filePath string, tracePath string) (bool, bool, string, string, error) {
+func compare(filename string, filePath string, ghostPath string) (bool, bool, string, string, error) {
 	currentHash, err := calcHash(filePath)
 	if err != nil {
 		return false, false, "", "", fmt.Errorf("failed to calculate hash: %w", err)
 	}
 
-	data, err := readTrace(tracePath)
+	data, err := readGhost(ghostPath)
 	if err != nil {
 		return false, false, currentHash, "", err
 	}
@@ -68,16 +68,16 @@ func compare(filename string, filePath string, tracePath string) (bool, bool, st
 	return true, hashesMatch, currentHash, storedHash, nil
 }
 
-func readTrace(tracePath string) (map[string]fileData, error) {
+func readGhost(ghostPath string) (map[string]fileData, error) {
 	data := make(map[string]fileData)
 
-	if _, err := os.Stat(tracePath); os.IsNotExist(err) {
+	if _, err := os.Stat(ghostPath); os.IsNotExist(err) {
 		return data, nil
 	}
 
-	yamlBytes, err := os.ReadFile(tracePath)
+	yamlBytes, err := os.ReadFile(ghostPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read trace file: %w", err)
+		return nil, fmt.Errorf("failed to read ghost file: %w", err)
 	}
 
 	if len(yamlBytes) == 0 {
@@ -92,13 +92,13 @@ func readTrace(tracePath string) (map[string]fileData, error) {
 	return data, nil
 }
 
-func writeTrace(data map[string]fileData, tracePath string) error {
+func writeGhost(data map[string]fileData, ghostPath string) error {
 	yamlBytes, err := yaml.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal YAML: %w", err)
 	}
 
-	err = os.WriteFile(tracePath, yamlBytes, 0644)
+	err = os.WriteFile(ghostPath, yamlBytes, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
@@ -106,15 +106,15 @@ func writeTrace(data map[string]fileData, tracePath string) error {
 	return nil
 }
 
-func addF(filePath string, tracePath string) error {
+func addF(filePath string, ghostPath string) error {
 	filename := filepath.Base(filePath)
 
-	isInTrace, hashesMatch, currentHash, storedHash, err := compare(filename, filePath, tracePath)
+	isInGhost, hashesMatch, currentHash, storedHash, err := compare(filename, filePath, ghostPath)
 	if err != nil {
 		return err
 	}
 
-	if isInTrace {
+	if isInGhost {
 		if hashesMatch {
 			fmt.Printf("\033[36mFilename:\033[0m %s\n", filename)
 			fmt.Printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
@@ -122,7 +122,7 @@ func addF(filePath string, tracePath string) error {
 			fmt.Println("\033[32mStatus: Hashes match ✓\033[0m")
 			return nil
 		} else {
-			fmt.Printf("\033[33mWarning:\033[0m File '%s' already exists in trace with a different hash.\n", filename)
+			fmt.Printf("\033[33mWarning:\033[0m File '%s' already exists in ghost with a different hash.\n", filename)
 			fmt.Printf("Existing hash: %s\n", storedHash)
 			fmt.Printf("New hash: %s\n", currentHash)
 			fmt.Print("Do you want to overwrite it? (y/n): ")
@@ -136,7 +136,7 @@ func addF(filePath string, tracePath string) error {
 		}
 	}
 
-	data, err := readTrace(tracePath)
+	data, err := readGhost(ghostPath)
 	if err != nil {
 		return err
 	}
@@ -145,11 +145,11 @@ func addF(filePath string, tracePath string) error {
 		Blake2b: currentHash,
 	}
 
-	fmt.Printf("\033[32mFile Added to Trace:\033[0m\n")
+	fmt.Printf("\033[32mFile Added to Ghost:\033[0m\n")
 	fmt.Printf("\033[36mFilename:\033[0m %s\n", filename)
 	fmt.Printf("\033[36mBlake2b Hash:\033[0m %s\n", currentHash)
 
-	return writeTrace(data, tracePath)
+	return writeGhost(data, ghostPath)
 }
 
 func add(path string, recursive bool) error {
@@ -160,7 +160,7 @@ func add(path string, recursive bool) error {
 
 	if fileInfo.IsDir() {
 		fmt.Printf("\033[36mProcessing directory:\033[0m %s\n", path)
-		dirTracePath := filepath.Join(path, ".trace")
+		dirGhostPath := filepath.Join(path, ".ghost")
 
 		if recursive {
 			err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
@@ -169,19 +169,19 @@ func add(path string, recursive bool) error {
 				}
 
 				if d.IsDir() && filePath != path {
-					dirTraceFile := filepath.Join(filePath, ".trace")
-					if _, err := os.Stat(dirTraceFile); os.IsNotExist(err) {
-						if err := writeTrace(make(map[string]fileData), dirTraceFile); err != nil {
-							return fmt.Errorf("failed to create trace file in %s: %w", filePath, err)
+					dirGhostFile := filepath.Join(filePath, ".ghost")
+					if _, err := os.Stat(dirGhostFile); os.IsNotExist(err) {
+						if err := writeGhost(make(map[string]fileData), dirGhostFile); err != nil {
+							return fmt.Errorf("failed to create ghost file in %s: %w", filePath, err)
 						}
 					}
 					return nil
 				}
 
-				if !d.IsDir() && filepath.Base(filePath) != ".trace" {
+				if !d.IsDir() && filepath.Base(filePath) != ".ghost" {
 					dirPath := filepath.Dir(filePath)
-					localTracePath := filepath.Join(dirPath, ".trace")
-					return addF(filePath, localTracePath)
+					localGhostPath := filepath.Join(dirPath, ".ghost")
+					return addF(filePath, localGhostPath)
 				}
 				return nil
 			})
@@ -195,47 +195,47 @@ func add(path string, recursive bool) error {
 			}
 
 			for _, file := range files {
-				if !file.IsDir() && file.Name() != ".trace" {
+				if !file.IsDir() && file.Name() != ".ghost" {
 					filePath := filepath.Join(path, file.Name())
-					if err := addF(filePath, dirTracePath); err != nil {
+					if err := addF(filePath, dirGhostPath); err != nil {
 						fmt.Printf("\033[33mWarning: %v\033[0m\n", err)
 					}
 				}
 			}
 		}
 
-		fmt.Printf("\033[36mSaved to:\033[0m %s\n", dirTracePath)
+		fmt.Printf("\033[36mSaved to:\033[0m %s\n", dirGhostPath)
 		return nil
 	}
 
 	dirPath := filepath.Dir(path)
-	fileTracePath := filepath.Join(dirPath, ".trace")
+	fileGhostPath := filepath.Join(dirPath, ".ghost")
 
-	err = addF(path, fileTracePath)
+	err = addF(path, fileGhostPath)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("\033[36mSaved to:\033[0m %s\n", fileTracePath)
+	fmt.Printf("\033[36mSaved to:\033[0m %s\n", fileGhostPath)
 	return nil
 }
 
-func delF(filename string, tracePath string) error {
-	data, err := readTrace(tracePath)
+func delF(filename string, ghostPath string) error {
+	data, err := readGhost(ghostPath)
 	if err != nil {
 		return err
 	}
 
 	if _, exists := data[filename]; !exists {
-		return fmt.Errorf("file %s not found in trace", filename)
+		return fmt.Errorf("file %s not found in ghost", filename)
 	}
 
 	delete(data, filename)
 
-	fmt.Printf("\033[32mFile Removed from Trace:\033[0m\n")
+	fmt.Printf("\033[32mFile Removed from Ghost:\033[0m\n")
 	fmt.Printf("\033[36mFilename:\033[0m %s\n", filename)
 
-	return writeTrace(data, tracePath)
+	return writeGhost(data, ghostPath)
 }
 
 func del(path string, recursive bool) error {
@@ -246,7 +246,7 @@ func del(path string, recursive bool) error {
 
 	if fileInfo.IsDir() {
 		fmt.Printf("\033[36mProcessing directory:\033[0m %s\n", path)
-		dirTracePath := filepath.Join(path, ".trace")
+		dirGhostPath := filepath.Join(path, ".ghost")
 
 		if recursive {
 			err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
@@ -254,10 +254,10 @@ func del(path string, recursive bool) error {
 					return err
 				}
 
-				if !d.IsDir() && filepath.Base(filePath) != ".trace" {
+				if !d.IsDir() && filepath.Base(filePath) != ".ghost" {
 					dirPath := filepath.Dir(filePath)
-					localTracePath := filepath.Join(dirPath, ".trace")
-					return delF(filePath, localTracePath)
+					localGhostPath := filepath.Join(dirPath, ".ghost")
+					return delF(filePath, localGhostPath)
 				}
 				return nil
 			})
@@ -271,41 +271,41 @@ func del(path string, recursive bool) error {
 			}
 
 			for _, file := range files {
-				if !file.IsDir() && file.Name() != ".trace" {
+				if !file.IsDir() && file.Name() != ".ghost" {
 					filePath := filepath.Join(path, file.Name())
-					if err := delF(filePath, dirTracePath); err != nil {
+					if err := delF(filePath, dirGhostPath); err != nil {
 						fmt.Printf("\033[33mWarning: %v\033[0m\n", err)
 					}
 				}
 			}
 		}
 
-		fmt.Printf("\033[36mSaved to:\033[0m %s\n", dirTracePath)
+		fmt.Printf("\033[36mSaved to:\033[0m %s\n", dirGhostPath)
 		return nil
 	}
 
 	dirPath := filepath.Dir(path)
-	fileTracePath := filepath.Join(dirPath, ".trace")
+	fileGhostPath := filepath.Join(dirPath, ".ghost")
 
-	err = delF(path, fileTracePath)
+	err = delF(path, fileGhostPath)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("\033[36mSaved to:\033[0m %s\n", fileTracePath)
+	fmt.Printf("\033[36mSaved to:\033[0m %s\n", fileGhostPath)
 	return nil
 }
 
-func checkF(filePath string, tracePath string) error {
+func checkF(filePath string, ghostPath string) error {
 	filename := filepath.Base(filePath)
 
-	isInTrace, hashesMatch, currentHash, storedHash, err := compare(filename, filePath, tracePath)
+	isInGhost, hashesMatch, currentHash, storedHash, err := compare(filename, filePath, ghostPath)
 	if err != nil {
 		return err
 	}
 
-	if !isInTrace {
-		fmt.Printf("\033[33mFile '%s' not found in trace.\033[0m\n", filename)
+	if !isInGhost {
+		fmt.Printf("\033[33mFile '%s' not found in ghost.\033[0m\n", filename)
 		fmt.Printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
 		return nil
 	}
@@ -331,7 +331,7 @@ func check(path string, recursive bool) error {
 
 	if fileInfo.IsDir() {
 		fmt.Printf("\033[36mChecking directory:\033[0m %s\n", path)
-		dirTracePath := filepath.Join(path, ".trace")
+		dirGhostPath := filepath.Join(path, ".ghost")
 
 		if recursive {
 			err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
@@ -339,10 +339,10 @@ func check(path string, recursive bool) error {
 					return err
 				}
 
-				if !d.IsDir() && filepath.Base(filePath) != ".trace" {
+				if !d.IsDir() && filepath.Base(filePath) != ".ghost" {
 					dirPath := filepath.Dir(filePath)
-					localTracePath := filepath.Join(dirPath, ".trace")
-					if err := checkF(filePath, localTracePath); err != nil {
+					localGhostPath := filepath.Join(dirPath, ".ghost")
+					if err := checkF(filePath, localGhostPath); err != nil {
 						fmt.Printf("\033[31mError: %v\033[0m\n", err)
 					}
 				}
@@ -358,9 +358,9 @@ func check(path string, recursive bool) error {
 			}
 
 			for _, file := range files {
-				if !file.IsDir() && file.Name() != ".trace" {
+				if !file.IsDir() && file.Name() != ".ghost" {
 					filePath := filepath.Join(path, file.Name())
-					if err := checkF(filePath, dirTracePath); err != nil {
+					if err := checkF(filePath, dirGhostPath); err != nil {
 						fmt.Printf("\033[31mError: %v\033[0m\n", err)
 					}
 				}
@@ -370,9 +370,9 @@ func check(path string, recursive bool) error {
 	}
 
 	dirPath := filepath.Dir(path)
-	fileTracePath := filepath.Join(dirPath, ".trace")
+	fileGhostPath := filepath.Join(dirPath, ".ghost")
 
-	return checkF(path, fileTracePath)
+	return checkF(path, fileGhostPath)
 }
 
 func main() {
@@ -418,3 +418,4 @@ func main() {
 		os.Exit(1)
 	}
 }
+
