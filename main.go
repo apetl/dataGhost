@@ -152,7 +152,7 @@ func addF(filePath string, tracePath string) error {
 	return writeTrace(data, tracePath)
 }
 
-func add(path string) error {
+func add(path string, recursive bool) error {
 	fileInfo, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to access path: %w", err)
@@ -160,27 +160,48 @@ func add(path string) error {
 
 	if fileInfo.IsDir() {
 		fmt.Printf("\033[36mProcessing directory:\033[0m %s\n", path)
-
 		dirTracePath := filepath.Join(path, ".trace")
 
-		err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
+		if recursive {
+			err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+
+				if d.IsDir() && filePath != path {
+					dirTraceFile := filepath.Join(filePath, ".trace")
+					if _, err := os.Stat(dirTraceFile); os.IsNotExist(err) {
+						if err := writeTrace(make(map[string]fileData), dirTraceFile); err != nil {
+							return fmt.Errorf("failed to create trace file in %s: %w", filePath, err)
+						}
+					}
+					return nil
+				}
+
+				if !d.IsDir() && filepath.Base(filePath) != ".trace" {
+					dirPath := filepath.Dir(filePath)
+					localTracePath := filepath.Join(dirPath, ".trace")
+					return addF(filePath, localTracePath)
+				}
+				return nil
+			})
 			if err != nil {
-				return err
+				return fmt.Errorf("error processing directory recursively: %w", err)
+			}
+		} else {
+			files, err := os.ReadDir(path)
+			if err != nil {
+				return fmt.Errorf("failed to read directory: %w", err)
 			}
 
-			if d.IsDir() {
-				return nil
+			for _, file := range files {
+				if !file.IsDir() && file.Name() != ".trace" {
+					filePath := filepath.Join(path, file.Name())
+					if err := addF(filePath, dirTracePath); err != nil {
+						fmt.Printf("\033[33mWarning: %v\033[0m\n", err)
+					}
+				}
 			}
-
-			if filepath.Base(filePath) == ".trace" {
-				return nil
-			}
-
-			return addF(filePath, dirTracePath)
-		})
-
-		if err != nil {
-			return fmt.Errorf("error processing directory: %w", err)
 		}
 
 		fmt.Printf("\033[36mSaved to:\033[0m %s\n", dirTracePath)
@@ -217,48 +238,61 @@ func delF(filename string, tracePath string) error {
 	return writeTrace(data, tracePath)
 }
 
-func del(path string) error {
+func del(path string, recursive bool) error {
 	fileInfo, err := os.Stat(path)
 	if err != nil {
-		dirPath := filepath.Dir(path)
-		fileTracePath := filepath.Join(dirPath, ".trace")
-		filename := filepath.Base(path)
-		return delF(filename, fileTracePath)
+		return fmt.Errorf("failed to access path: %w", err)
 	}
 
 	if fileInfo.IsDir() {
 		fmt.Printf("\033[36mProcessing directory:\033[0m %s\n", path)
-
 		dirTracePath := filepath.Join(path, ".trace")
 
-		files, err := os.ReadDir(path)
-		if err != nil {
-			return fmt.Errorf("failed to read directory: %w", err)
-		}
-
-		for _, file := range files {
-			if !file.IsDir() && file.Name() != ".trace" {
-				err := delF(file.Name(), dirTracePath)
+		if recursive {
+			err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
 				if err != nil {
-					fmt.Printf("\033[33mWarning:\033[0m %v\n", err)
+					return err
+				}
+
+				if !d.IsDir() && filepath.Base(filePath) != ".trace" {
+					dirPath := filepath.Dir(filePath)
+					localTracePath := filepath.Join(dirPath, ".trace")
+					return delF(filePath, localTracePath)
+				}
+				return nil
+			})
+			if err != nil {
+				return fmt.Errorf("error processing directory recursively: %w", err)
+			}
+		} else {
+			files, err := os.ReadDir(path)
+			if err != nil {
+				return fmt.Errorf("failed to read directory: %w", err)
+			}
+
+			for _, file := range files {
+				if !file.IsDir() && file.Name() != ".trace" {
+					filePath := filepath.Join(path, file.Name())
+					if err := delF(filePath, dirTracePath); err != nil {
+						fmt.Printf("\033[33mWarning: %v\033[0m\n", err)
+					}
 				}
 			}
 		}
 
-		fmt.Printf("\033[36mRemoved from:\033[0m %s\n", dirTracePath)
+		fmt.Printf("\033[36mSaved to:\033[0m %s\n", dirTracePath)
 		return nil
 	}
 
 	dirPath := filepath.Dir(path)
 	fileTracePath := filepath.Join(dirPath, ".trace")
-	filename := filepath.Base(path)
 
-	err = delF(filename, fileTracePath)
+	err = delF(path, fileTracePath)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("\033[36mRemoved from:\033[0m %s\n", fileTracePath)
+	fmt.Printf("\033[36mSaved to:\033[0m %s\n", fileTracePath)
 	return nil
 }
 
@@ -289,7 +323,7 @@ func checkF(filePath string, tracePath string) error {
 	return nil
 }
 
-func check(path string) error {
+func check(path string, recursive bool) error {
 	fileInfo, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to access path: %w", err)
@@ -297,31 +331,41 @@ func check(path string) error {
 
 	if fileInfo.IsDir() {
 		fmt.Printf("\033[36mChecking directory:\033[0m %s\n", path)
-
 		dirTracePath := filepath.Join(path, ".trace")
 
-		err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
+		if recursive {
+			err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+
+				if !d.IsDir() && filepath.Base(filePath) != ".trace" {
+					dirPath := filepath.Dir(filePath)
+					localTracePath := filepath.Join(dirPath, ".trace")
+					if err := checkF(filePath, localTracePath); err != nil {
+						fmt.Printf("\033[31mError: %v\033[0m\n", err)
+					}
+				}
+				return nil
+			})
 			if err != nil {
-				return err
+				return fmt.Errorf("error checking directory recursively: %w", err)
+			}
+		} else {
+			files, err := os.ReadDir(path)
+			if err != nil {
+				return fmt.Errorf("failed to read directory: %w", err)
 			}
 
-			if d.IsDir() {
-				return nil
+			for _, file := range files {
+				if !file.IsDir() && file.Name() != ".trace" {
+					filePath := filepath.Join(path, file.Name())
+					if err := checkF(filePath, dirTracePath); err != nil {
+						fmt.Printf("\033[31mError: %v\033[0m\n", err)
+					}
+				}
 			}
-
-			// Skip .trace file itself
-			if filepath.Base(filePath) == ".trace" {
-				return nil
-			}
-
-			fmt.Printf("\n--- Checking %s ---\n", filePath)
-			return checkF(filePath, dirTracePath)
-		})
-
-		if err != nil {
-			return fmt.Errorf("error checking directory: %w", err)
 		}
-
 		return nil
 	}
 
@@ -334,40 +378,43 @@ func check(path string) error {
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Println("Error: Please provide a command (add/del/check) and a file or directory path.")
-		fmt.Println("Usage: program add|del|check filepath")
+		fmt.Println("Usage: program add|del|check [-r] filepath")
+		fmt.Println("  -r: Process directories recursively")
 		os.Exit(1)
 	}
 
-	command := os.Args[1]
-	path := os.Args[2]
+	var command, path string
+	recursive := false
+
+	argIndex := 1
+	if os.Args[1] == "-r" {
+		if len(os.Args) < 4 {
+			fmt.Println("Error: Missing command or path after -r flag")
+			os.Exit(1)
+		}
+		recursive = true
+		argIndex = 2
+	}
+
+	command = os.Args[argIndex]
+	path = os.Args[argIndex+1]
 
 	var err error
 
 	switch command {
 	case "add":
-		err = add(path)
-		if err != nil {
-			fmt.Println("\033[31mError adding to trace:\033[0m", err)
-			os.Exit(1)
-		}
-
+		err = add(path, recursive)
 	case "del":
-		err = del(path)
-		if err != nil {
-			fmt.Println("\033[31mError removing from trace:\033[0m", err)
-			os.Exit(1)
-		}
-
+		err = del(path, recursive)
 	case "check":
-		err = check(path)
-		if err != nil {
-			fmt.Println("\033[31mError comparing:\033[0m", err)
-			os.Exit(1)
-		}
-
+		err = check(path, recursive)
 	default:
-		fmt.Println("\033[31mError: Invalid command. Use 'add', 'del', or 'check'.\033[0m")
+		fmt.Printf("Unknown command: %s\n", command)
+		os.Exit(1)
+	}
+
+	if err != nil {
+		fmt.Printf("\033[31mError: %v\033[0m\n", err)
 		os.Exit(1)
 	}
 }
-
