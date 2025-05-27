@@ -15,6 +15,30 @@ type fileData struct {
 	Blake2b string `yaml:"Blake2b"`
 }
 
+type stats struct {
+	checked   int
+	corrupted int
+	ok        int
+	errors    int
+}
+
+var (
+	quietMode   bool
+	globalStats stats
+)
+
+func printf(format string, args ...interface{}) {
+	if !quietMode {
+		fmt.Printf(format, args...)
+	}
+}
+
+func println(args ...interface{}) {
+	if !quietMode {
+		fmt.Println(args...)
+	}
+}
+
 func getBufferSize(file *os.File) int {
 	const (
 		minBuffer     = 64 * 1024   // 64KB
@@ -140,16 +164,16 @@ func addF(filePath string, ghostPath string) error {
 
 	if isInGhost {
 		if hashesMatch {
-			fmt.Printf("\033[36mFilename:\033[0m %s\n", filename)
-			fmt.Printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
-			fmt.Printf("\033[36mStored hash:\033[0m %s\n", storedHash)
-			fmt.Println("\033[32mStatus: Hashes match ✓\033[0m")
+			printf("\033[36mFilename:\033[0m %s\n", filename)
+			printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
+			printf("\033[36mStored hash:\033[0m %s\n", storedHash)
+			println("\033[32mStatus: Hashes match ✓\033[0m")
 			return nil
 		} else {
-			fmt.Printf("\033[33mWarning:\033[0m File '%s' already exists in ghost with a different hash.\n", filename)
-			fmt.Printf("Existing hash: %s\n", storedHash)
-			fmt.Printf("New hash: %s\n", currentHash)
-			fmt.Print("Do you want to overwrite it? (y/n): ")
+			printf("\033[33mWarning:\033[0m File '%s' already exists in ghost with a different hash.\n", filename)
+			printf("Existing hash: %s\n", storedHash)
+			printf("New hash: %s\n", currentHash)
+			printf("Do you want to overwrite it? (y/n): ")
 
 			var response string
 			fmt.Scanln(&response)
@@ -169,9 +193,9 @@ func addF(filePath string, ghostPath string) error {
 		Blake2b: currentHash,
 	}
 
-	fmt.Printf("\033[32mFile Added to Ghost:\033[0m\n")
-	fmt.Printf("\033[36mFilename:\033[0m %s\n", filename)
-	fmt.Printf("\033[36mBlake2b Hash:\033[0m %s\n", currentHash)
+	printf("\033[32mFile Added to Ghost:\033[0m\n")
+	printf("\033[36mFilename:\033[0m %s\n", filename)
+	printf("\033[36mBlake2b Hash:\033[0m %s\n", currentHash)
 
 	return writeGhost(data, ghostPath)
 }
@@ -183,7 +207,7 @@ func add(path string, recursive bool) error {
 	}
 
 	if fileInfo.IsDir() {
-		fmt.Printf("\033[36mProcessing directory:\033[0m %s\n", path)
+		printf("\033[36mProcessing directory:\033[0m %s\n", path)
 		dirGhostPath := filepath.Join(path, ".ghost")
 
 		if recursive {
@@ -222,13 +246,13 @@ func add(path string, recursive bool) error {
 				if !file.IsDir() && file.Name() != ".ghost" {
 					filePath := filepath.Join(path, file.Name())
 					if err := addF(filePath, dirGhostPath); err != nil {
-						fmt.Printf("\033[33mWarning: %v\033[0m\n", err)
+						printf("\033[33mWarning: %v\033[0m\n", err)
 					}
 				}
 			}
 		}
 
-		fmt.Printf("\033[36mSaved to:\033[0m %s\n", dirGhostPath)
+		printf("\033[36mSaved to:\033[0m %s\n", dirGhostPath)
 		return nil
 	}
 
@@ -240,7 +264,7 @@ func add(path string, recursive bool) error {
 		return err
 	}
 
-	fmt.Printf("\033[36mSaved to:\033[0m %s\n", fileGhostPath)
+	printf("\033[36mSaved to:\033[0m %s\n", fileGhostPath)
 	return nil
 }
 
@@ -256,8 +280,8 @@ func delF(filename string, ghostPath string) error {
 
 	delete(data, filename)
 
-	fmt.Printf("\033[32mFile Removed from Ghost:\033[0m\n")
-	fmt.Printf("\033[36mFilename:\033[0m %s\n", filename)
+	printf("\033[32mFile Removed from Ghost:\033[0m\n")
+	printf("\033[36mFilename:\033[0m %s\n", filename)
 
 	return writeGhost(data, ghostPath)
 }
@@ -269,7 +293,7 @@ func del(path string, recursive bool) error {
 	}
 
 	if fileInfo.IsDir() {
-		fmt.Printf("\033[36mProcessing directory:\033[0m %s\n", path)
+		printf("\033[36mProcessing directory:\033[0m %s\n", path)
 		dirGhostPath := filepath.Join(path, ".ghost")
 
 		if recursive {
@@ -298,13 +322,13 @@ func del(path string, recursive bool) error {
 				if !file.IsDir() && file.Name() != ".ghost" {
 					filePath := filepath.Join(path, file.Name())
 					if err := delF(filePath, dirGhostPath); err != nil {
-						fmt.Printf("\033[33mWarning: %v\033[0m\n", err)
+						printf("\033[33mWarning: %v\033[0m\n", err)
 					}
 				}
 			}
 		}
 
-		fmt.Printf("\033[36mSaved to:\033[0m %s\n", dirGhostPath)
+		printf("\033[36mSaved to:\033[0m %s\n", dirGhostPath)
 		return nil
 	}
 
@@ -316,7 +340,7 @@ func del(path string, recursive bool) error {
 		return err
 	}
 
-	fmt.Printf("\033[36mSaved to:\033[0m %s\n", fileGhostPath)
+	printf("\033[36mSaved to:\033[0m %s\n", fileGhostPath)
 	return nil
 }
 
@@ -325,23 +349,28 @@ func checkF(filePath string, ghostPath string) error {
 
 	isInGhost, hashesMatch, currentHash, storedHash, err := compare(filename, filePath, ghostPath)
 	if err != nil {
+		globalStats.errors++
 		return err
 	}
 
+	globalStats.checked++
+
 	if !isInGhost {
-		fmt.Printf("\033[33mFile '%s' not found in ghost.\033[0m\n", filename)
-		fmt.Printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
+		printf("\033[33mFile '%s' not found in ghost.\033[0m\n", filename)
+		printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
 		return nil
 	}
 
-	fmt.Printf("\033[36mFilename:\033[0m %s\n", filename)
-	fmt.Printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
-	fmt.Printf("\033[36mStored hash:\033[0m %s\n", storedHash)
+	printf("\033[36mFilename:\033[0m %s\n", filename)
+	printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
+	printf("\033[36mStored hash:\033[0m %s\n", storedHash)
 
 	if hashesMatch {
-		fmt.Println("\033[32mStatus: Hashes match ✓\033[0m")
+		globalStats.ok++
+		println("\033[32mStatus: Hashes match ✓\033[0m")
 	} else {
-		fmt.Println("\033[31mStatus: Hashes differ ✗\033[0m")
+		globalStats.corrupted++
+		println("\033[31mStatus: Hashes differ ✗\033[0m")
 	}
 
 	return nil
@@ -354,7 +383,7 @@ func check(path string, recursive bool) error {
 	}
 
 	if fileInfo.IsDir() {
-		fmt.Printf("\033[36mChecking directory:\033[0m %s\n", path)
+		printf("\033[36mChecking directory:\033[0m %s\n", path)
 		dirGhostPath := filepath.Join(path, ".ghost")
 
 		if recursive {
@@ -367,7 +396,7 @@ func check(path string, recursive bool) error {
 					dirPath := filepath.Dir(filePath)
 					localGhostPath := filepath.Join(dirPath, ".ghost")
 					if err := checkF(filePath, localGhostPath); err != nil {
-						fmt.Printf("\033[31mError: %v\033[0m\n", err)
+						printf("\033[31mError: %v\033[0m\n", err)
 					}
 				}
 				return nil
@@ -385,7 +414,7 @@ func check(path string, recursive bool) error {
 				if !file.IsDir() && file.Name() != ".ghost" {
 					filePath := filepath.Join(path, file.Name())
 					if err := checkF(filePath, dirGhostPath); err != nil {
-						fmt.Printf("\033[31mError: %v\033[0m\n", err)
+						printf("\033[31mError: %v\033[0m\n", err)
 					}
 				}
 			}
@@ -406,7 +435,7 @@ func cleanF(dirPath string, ghostPath string) error {
 	}
 
 	if len(data) == 0 {
-		fmt.Printf("\033[36mGhost file is empty at:\033[0m %s\n", ghostPath)
+		printf("\033[36mGhost file is empty at:\033[0m %s\n", ghostPath)
 		return nil
 	}
 
@@ -414,18 +443,18 @@ func cleanF(dirPath string, ghostPath string) error {
 	for filename := range data {
 		filePath := filepath.Join(dirPath, filename)
 		if _, err := os.Stat(filePath); os.IsNotExist(err) {
-			fmt.Printf("\033[33mMissing file:\033[0m %s\n", filename)
+			printf("\033[33mMissing file:\033[0m %s\n", filename)
 			delete(data, filename)
 			removedCount++
 		}
 	}
 
 	if removedCount > 0 {
-		fmt.Printf("\033[32mRemoved %d missing file(s) from ghost\033[0m\n", removedCount)
+		printf("\033[32mRemoved %d missing file(s) from ghost\033[0m\n", removedCount)
 		return writeGhost(data, ghostPath)
 	}
 
-	fmt.Printf("\033[32mNo missing files found in ghost\033[0m\n")
+	printf("\033[32mNo missing files found in ghost\033[0m\n")
 	return nil
 }
 
@@ -436,7 +465,7 @@ func clean(path string, recursive bool) error {
 	}
 
 	if fileInfo.IsDir() {
-		fmt.Printf("\033[36mCleaning directory:\033[0m %s\n", path)
+		printf("\033[36mCleaning directory:\033[0m %s\n", path)
 		dirGhostPath := filepath.Join(path, ".ghost")
 
 		if _, err := os.Stat(dirGhostPath); !os.IsNotExist(err) {
@@ -444,7 +473,7 @@ func clean(path string, recursive bool) error {
 				return fmt.Errorf("error cleaning ghost file: %w", err)
 			}
 		} else {
-			fmt.Printf("\033[33mNo ghost file found at:\033[0m %s\n", dirGhostPath)
+			printf("\033[33mNo ghost file found at:\033[0m %s\n", dirGhostPath)
 		}
 
 		if recursive {
@@ -457,7 +486,7 @@ func clean(path string, recursive bool) error {
 					subGhostPath := filepath.Join(subPath, ".ghost")
 					if _, err := os.Stat(subGhostPath); !os.IsNotExist(err) {
 						if err := cleanF(subPath, subGhostPath); err != nil {
-							fmt.Printf("\033[31mError cleaning %s: %v\033[0m\n", subPath, err)
+							printf("\033[31mError cleaning %s: %v\033[0m\n", subPath, err)
 						}
 					}
 				}
@@ -480,6 +509,17 @@ func clean(path string, recursive bool) error {
 	return cleanF(dirPath, fileGhostPath)
 }
 
+func printSummary() {
+	if globalStats.checked > 0 {
+		fmt.Printf("Checked %d files, %d corrupted, %d OK",
+			globalStats.checked, globalStats.corrupted, globalStats.ok)
+		if globalStats.errors > 0 {
+			fmt.Printf(", %d errors", globalStats.errors)
+		}
+		fmt.Println()
+	}
+}
+
 func help() {
 	fmt.Println("\033[38;5;183mUsage: dataGhost [OPTIONS] COMMAND\033[0m")
 	fmt.Println()
@@ -491,41 +531,66 @@ func help() {
 	fmt.Println()
 	fmt.Println("\033[38;5;116mOptions:\033[0m")
 	fmt.Println("  \033[38;5;148m-r\033[0m      Process directories recursively")
+	fmt.Println("  \033[38;5;148m-q\033[0m      Quiet mode (for scripting)")
+	fmt.Println()
+	fmt.Println("\033[38;5;116mExit codes:\033[0m")
+	fmt.Println("  0       Success")
+	fmt.Println("  1       Corruption found")
+	fmt.Println("  2       Error occurred")
 	fmt.Println()
 	fmt.Println("\033[38;5;116mExamples:\033[0m")
 	fmt.Println("  dataGhost \033[38;5;117madd\033[0m file.txt")
 	fmt.Println("  dataGhost \033[38;5;148m-r\033[0m \033[38;5;117mclean\033[0m")
+	fmt.Println("  dataGhost \033[38;5;148m-q\033[0m \033[38;5;117mcheck\033[0m .")
 }
 
 func main() {
 	if len(os.Args) < 2 {
 		help()
-		return
+		os.Exit(2)
 	}
 
 	if os.Args[1] == "help" {
 		help()
-		return
-	}
-
-	if len(os.Args) < 3 {
-		fmt.Printf("\033[38;5;204mError: Missing path for command: %s\033[0m\n", os.Args[1])
-		return
+		os.Exit(0)
 	}
 
 	var recursive bool
 	var command string
 	var path string
+	argIndex := 1
 
-	if os.Args[1] == "-r" {
-		recursive = true
-		command = os.Args[2]
-		path = os.Args[3]
-	} else {
-		recursive = false
-		command = os.Args[1]
-		path = os.Args[2]
+	// Parse flags
+	for argIndex < len(os.Args) && os.Args[argIndex][0] == '-' {
+		switch os.Args[argIndex] {
+		case "-r":
+			recursive = true
+		case "-q":
+			quietMode = true
+		case "-rq", "-qr":
+			recursive = true
+			quietMode = true
+		default:
+			fmt.Printf("\033[38;5;204mError: Unknown flag: %s\033[0m\n", os.Args[argIndex])
+			os.Exit(2)
+		}
+		argIndex++
 	}
+
+	if argIndex >= len(os.Args) {
+		fmt.Printf("\033[38;5;204mError: Missing command\033[0m\n")
+		os.Exit(2)
+	}
+
+	command = os.Args[argIndex]
+	argIndex++
+
+	if argIndex >= len(os.Args) {
+		fmt.Printf("\033[38;5;204mError: Missing path for command: %s\033[0m\n", command)
+		os.Exit(2)
+	}
+
+	path = os.Args[argIndex]
 
 	var err error
 	switch command {
@@ -535,15 +600,22 @@ func main() {
 		err = del(path, recursive)
 	case "check":
 		err = check(path, recursive)
+		printSummary()
+		if globalStats.corrupted > 0 {
+			os.Exit(1)
+		}
 	case "clean":
 		err = clean(path, recursive)
 	default:
 		fmt.Printf("\033[38;5;204mError: Unknown command: %s\033[0m\n", command)
 		help()
-		return
+		os.Exit(2)
 	}
 
 	if err != nil {
 		fmt.Printf("\033[38;5;204mError: %v\033[0m\n", err)
+		os.Exit(2)
 	}
+
+	os.Exit(0)
 }
