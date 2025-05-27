@@ -15,6 +15,30 @@ type fileData struct {
 	Blake2b string `yaml:"Blake2b"`
 }
 
+func getBufferSize(file *os.File) int {
+	const (
+		minBuffer     = 64 * 1024   // 64KB
+		maxBuffer     = 1024 * 1024 // 1MB
+		defaultBuffer = 256 * 1024  // 256KB
+	)
+
+	stat, err := file.Stat()
+	if err != nil {
+		return defaultBuffer
+	}
+
+	fileSize := stat.Size()
+
+	switch {
+	case fileSize < 1024*1024: // < 1MB
+		return minBuffer
+	case fileSize < 100*1024*1024: // < 100MB
+		return defaultBuffer
+	default: // >= 100MB
+		return maxBuffer
+	}
+}
+
 func calcHash(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -27,7 +51,7 @@ func calcHash(path string) (string, error) {
 		return "", fmt.Errorf("failed to create BLAKE2b hash: %w", err)
 	}
 
-	buffer := make([]byte, 64*1024)
+	buffer := make([]byte, getBufferSize(file))
 
 	for {
 		bytesRead, err := file.Read(buffer)
