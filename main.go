@@ -27,7 +27,7 @@ func calcHash(path string) (string, error) {
 		return "", fmt.Errorf("failed to create BLAKE2b hash: %w", err)
 	}
 
-	buffer := make([]byte, 4096)
+	buffer := make([]byte, 64*1024)
 
 	for {
 		bytesRead, err := file.Read(buffer)
@@ -456,40 +456,54 @@ func clean(path string, recursive bool) error {
 	return cleanF(dirPath, fileGhostPath)
 }
 
+func help() {
+	fmt.Println("\033[38;5;183mUsage: dataGhost [OPTIONS] COMMAND\033[0m")
+	fmt.Println()
+	fmt.Println("\033[38;5;116mCommands:\033[0m")
+	fmt.Println("  \033[38;5;117madd\033[0m     Add files to tracking")
+	fmt.Println("  \033[38;5;117mdel\033[0m     Delete tracked files")
+	fmt.Println("  \033[38;5;117mcheck\033[0m   Check status of tracked files")
+	fmt.Println("  \033[38;5;117mclean\033[0m   Clean up tracked files")
+	fmt.Println()
+	fmt.Println("\033[38;5;116mOptions:\033[0m")
+	fmt.Println("  \033[38;5;148m-r\033[0m      Process directories recursively")
+	fmt.Println()
+	fmt.Println("\033[38;5;116mExamples:\033[0m")
+	fmt.Println("  dataGhost \033[38;5;117madd\033[0m file.txt")
+	fmt.Println("  dataGhost \033[38;5;148m-r\033[0m \033[38;5;117mclean\033[0m")
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Error: Please provide a command (add/del/check/clean) and a file or directory path.")
-		fmt.Println("Usage: program add|del|check|clean [-r] [filepath]")
-		fmt.Println("  -r: Process directories recursively")
-		os.Exit(1)
+		help()
+		return
 	}
 
-	var command, path string
-	recursive := false
-	argIndex := 1
+	if os.Args[1] == "help" {
+		help()
+		return
+	}
+
+	if len(os.Args) < 3 {
+		fmt.Printf("\033[38;5;204mError: Missing path for command: %s\033[0m\n", os.Args[1])
+		return
+	}
+
+	var recursive bool
+	var command string
+	var path string
 
 	if os.Args[1] == "-r" {
-		if len(os.Args) < 3 {
-			fmt.Println("Error: Missing command after -r flag")
-			os.Exit(1)
-		}
 		recursive = true
-		argIndex = 2
-	}
-
-	command = os.Args[argIndex]
-
-	if command == "clean" && len(os.Args) <= argIndex+1 {
-		path = "."
-	} else if len(os.Args) <= argIndex+1 {
-		fmt.Printf("Error: Missing path for command: %s\n", command)
-		os.Exit(1)
+		command = os.Args[2]
+		path = os.Args[3]
 	} else {
-		path = os.Args[argIndex+1]
+		recursive = false
+		command = os.Args[1]
+		path = os.Args[2]
 	}
 
 	var err error
-
 	switch command {
 	case "add":
 		err = add(path, recursive)
@@ -500,12 +514,12 @@ func main() {
 	case "clean":
 		err = clean(path, recursive)
 	default:
-		fmt.Printf("Unknown command: %s\n", command)
-		os.Exit(1)
+		fmt.Printf("\033[38;5;204mError: Unknown command: %s\033[0m\n", command)
+		help()
+		return
 	}
 
 	if err != nil {
-		fmt.Printf("\033[31mError: %v\033[0m\n", err)
-		os.Exit(1)
+		fmt.Printf("\033[38;5;204mError: %v\033[0m\n", err)
 	}
 }
