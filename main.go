@@ -560,7 +560,6 @@ func main() {
 	var path string
 	argIndex := 1
 
-	// Parse flags
 	for argIndex < len(os.Args) && os.Args[argIndex][0] == '-' {
 		switch os.Args[argIndex] {
 		case "-r":
