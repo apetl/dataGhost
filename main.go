@@ -147,32 +147,6 @@ func writeGhost(data map[string]fileData, ghostPath string) error {
 	return nil
 }
 
-func compare(filename string, filePath string, ghostPath string) (bool, bool, string, string, error) {
-	currentHash, err := calcHash(filePath)
-	if err != nil {
-		return false, false, "", "", fmt.Errorf("failed to calculate hash: %w", err)
-	}
-
-	mutex := getGhostMutex(ghostPath)
-	mutex.Lock()
-	defer mutex.Unlock()
-
-	data, err := readGhost(ghostPath)
-	if err != nil {
-		return false, false, currentHash, "", err
-	}
-
-	storedData, exists := data[filename]
-	if !exists {
-		return false, false, currentHash, "", nil
-	}
-
-	storedHash := storedData.Blake2b
-	hashesMatch := currentHash == storedHash
-
-	return true, hashesMatch, currentHash, storedHash, nil
-}
-
 func addF(filePath string, ghostPath string, forceOverwrite bool) error {
 	filename := filepath.Base(filePath)
 
