@@ -147,7 +147,33 @@ func writeGhost(data map[string]fileData, ghostPath string) error {
 	return nil
 }
 
-func addF(filePath string, ghostPath string) error {
+func compare(filename string, filePath string, ghostPath string) (bool, bool, string, string, error) {
+	currentHash, err := calcHash(filePath)
+	if err != nil {
+		return false, false, "", "", fmt.Errorf("failed to calculate hash: %w", err)
+	}
+
+	mutex := getGhostMutex(ghostPath)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	data, err := readGhost(ghostPath)
+	if err != nil {
+		return false, false, currentHash, "", err
+	}
+
+	storedData, exists := data[filename]
+	if !exists {
+		return false, false, currentHash, "", nil
+	}
+
+	storedHash := storedData.Blake2b
+	hashesMatch := currentHash == storedHash
+
+	return true, hashesMatch, currentHash, storedHash, nil
+}
+
+func addF(filePath string, ghostPath string, forceOverwrite bool) error {
 	filename := filepath.Base(filePath)
 
 	currentHash, err := calcHash(filePath)
@@ -173,7 +199,7 @@ func addF(filePath string, ghostPath string) error {
 			printf("\033[36mStored hash:\033[0m %s\n", storedHash)
 			println("\033[32mStatus: Hashes match ✓\033[0m")
 			return nil
-		} else {
+		} else if !forceOverwrite {
 			printf("\033[33mWarning:\033[0m File '%s' already exists in ghost with a different hash.\n", filename)
 			printf("Existing hash: %s\n", storedHash)
 			printf("New hash: %s\n", currentHash)
@@ -197,6 +223,88 @@ func addF(filePath string, ghostPath string) error {
 	printf("\033[36mBlake2b Hash:\033[0m %s\n", currentHash)
 
 	return writeGhost(data, ghostPath)
+}
+
+func processFiles(path string, recursive bool, operation func(string, string) error) error {
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("failed to access path: %w", err)
+	}
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, parallelism)
+
+	if fileInfo.IsDir() {
+		printf("\033[36mProcessing directory:\033[0m %s\n", path)
+		dirGhostPath := filepath.Join(path, ".ghost")
+
+		if recursive {
+			err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+
+				if !d.IsDir() && filepath.Base(filePath) != ".ghost" {
+					wg.Add(1)
+					sem <- struct{}{}
+					go func(filePath string) {
+						defer wg.Done()
+						defer func() { <-sem }()
+						dirPath := filepath.Dir(filePath)
+						localGhostPath := filepath.Join(dirPath, ".ghost")
+						if err := operation(filePath, localGhostPath); err != nil {
+							printf("\033[33mWarning: %v\033[0m\n", err)
+						}
+					}(filePath)
+				}
+				return nil
+			})
+			if err != nil {
+				return fmt.Errorf("error processing directory recursively: %w", err)
+			}
+		} else {
+			files, err := os.ReadDir(path)
+			if err != nil {
+				return fmt.Errorf("failed to read directory: %w", err)
+			}
+
+			for _, file := range files {
+				if !file.IsDir() && file.Name() != ".ghost" {
+					wg.Add(1)
+					sem <- struct{}{}
+					go func(file os.DirEntry) {
+						defer wg.Done()
+						defer func() { <-sem }()
+						filePath := filepath.Join(path, file.Name())
+						if err := operation(filePath, dirGhostPath); err != nil {
+							printf("\033[33mWarning: %v\033[0m\n", err)
+						}
+					}(file)
+				}
+			}
+		}
+
+		wg.Wait()
+		printf("\033[36mSaved to:\033[0m %s\n", dirGhostPath)
+		return nil
+	}
+
+	dirPath := filepath.Dir(path)
+	fileGhostPath := filepath.Join(dirPath, ".ghost")
+
+	err = operation(path, fileGhostPath)
+	if err != nil {
+		return err
+	}
+
+	printf("\033[36mSaved to:\033[0m %s\n", fileGhostPath)
+	return nil
+}
+
+func add(path string, recursive bool, forceOverwrite bool) error {
+	return processFiles(path, recursive, func(filePath, ghostPath string) error {
+		return addF(filePath, ghostPath, forceOverwrite)
+	})
 }
 
 func delF(filePath string, ghostPath string) error {
@@ -223,170 +331,8 @@ func delF(filePath string, ghostPath string) error {
 	return writeGhost(data, ghostPath)
 }
 
-func add(path string, recursive bool) error {
-	fileInfo, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("failed to access path: %w", err)
-	}
-
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, parallelism)
-
-	if fileInfo.IsDir() {
-		printf("\033[36mProcessing directory:\033[0m %s\n", path)
-		dirGhostPath := filepath.Join(path, ".ghost")
-
-		if recursive {
-			err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-
-				if d.IsDir() && filePath != path {
-					dirGhostFile := filepath.Join(filePath, ".ghost")
-					mutex := getGhostMutex(dirGhostFile)
-					mutex.Lock()
-					if _, err := os.Stat(dirGhostFile); os.IsNotExist(err) {
-						if err := writeGhost(make(map[string]fileData), dirGhostFile); err != nil {
-							mutex.Unlock()
-							return fmt.Errorf("failed to create ghost file in %s: %w", filePath, err)
-						}
-					}
-					mutex.Unlock()
-					return nil
-				}
-
-				if !d.IsDir() && filepath.Base(filePath) != ".ghost" {
-					wg.Add(1)
-					sem <- struct{}{}
-					go func(filePath string) {
-						defer wg.Done()
-						defer func() { <-sem }()
-						dirPath := filepath.Dir(filePath)
-						localGhostPath := filepath.Join(dirPath, ".ghost")
-						if err := addF(filePath, localGhostPath); err != nil {
-							printf("\033[33mWarning: %v\033[0m\n", err)
-						}
-					}(filePath)
-				}
-				return nil
-			})
-			if err != nil {
-				return fmt.Errorf("error processing directory recursively: %w", err)
-			}
-		} else {
-			files, err := os.ReadDir(path)
-			if err != nil {
-				return fmt.Errorf("failed to read directory: %w", err)
-			}
-
-			for _, file := range files {
-				if !file.IsDir() && file.Name() != ".ghost" {
-					wg.Add(1)
-					sem <- struct{}{}
-					go func(file os.DirEntry) {
-						defer wg.Done()
-						defer func() { <-sem }()
-						filePath := filepath.Join(path, file.Name())
-						if err := addF(filePath, dirGhostPath); err != nil {
-							printf("\033[33mWarning: %v\033[0m\n", err)
-						}
-					}(file)
-				}
-			}
-		}
-
-		wg.Wait()
-		printf("\033[36mSaved to:\033[0m %s\n", dirGhostPath)
-		return nil
-	}
-
-	dirPath := filepath.Dir(path)
-	fileGhostPath := filepath.Join(dirPath, ".ghost")
-
-	err = addF(path, fileGhostPath)
-	if err != nil {
-		return err
-	}
-
-	printf("\033[36mSaved to:\033[0m %s\n", fileGhostPath)
-	return nil
-}
-
 func del(path string, recursive bool) error {
-	fileInfo, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("failed to access path: %w", err)
-	}
-
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, parallelism)
-
-	if fileInfo.IsDir() {
-		printf("\033[36mProcessing directory:\033[0m %s\n", path)
-		dirGhostPath := filepath.Join(path, ".ghost")
-
-		if recursive {
-			err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-
-				if !d.IsDir() && filepath.Base(filePath) != ".ghost" {
-					wg.Add(1)
-					sem <- struct{}{}
-					go func(filePath string) {
-						defer wg.Done()
-						defer func() { <-sem }()
-						dirPath := filepath.Dir(filePath)
-						localGhostPath := filepath.Join(dirPath, ".ghost")
-						if err := delF(filePath, localGhostPath); err != nil {
-							printf("\033[33mWarning: %v\033[0m\n", err)
-						}
-					}(filePath)
-				}
-				return nil
-			})
-			if err != nil {
-				return fmt.Errorf("error processing directory recursively: %w", err)
-			}
-		} else {
-			files, err := os.ReadDir(path)
-			if err != nil {
-				return fmt.Errorf("failed to read directory: %w", err)
-			}
-
-			for _, file := range files {
-				if !file.IsDir() && file.Name() != ".ghost" {
-					wg.Add(1)
-					sem <- struct{}{}
-					go func(file os.DirEntry) {
-						defer wg.Done()
-						defer func() { <-sem }()
-						filePath := filepath.Join(path, file.Name())
-						if err := delF(filePath, dirGhostPath); err != nil {
-							printf("\033[33mWarning: %v\033[0m\n", err)
-						}
-					}(file)
-				}
-			}
-		}
-
-		wg.Wait()
-		printf("\033[36mSaved to:\033[0m %s\n", dirGhostPath)
-		return nil
-	}
-
-	dirPath := filepath.Dir(path)
-	fileGhostPath := filepath.Join(dirPath, ".ghost")
-
-	err = delF(path, fileGhostPath)
-	if err != nil {
-		return err
-	}
-
-	printf("\033[36mSaved to:\033[0m %s\n", fileGhostPath)
-	return nil
+	return processFiles(path, recursive, delF)
 }
 
 func checkF(filePath string, ghostPath string) error {
@@ -434,72 +380,7 @@ func checkF(filePath string, ghostPath string) error {
 }
 
 func check(path string, recursive bool) error {
-	fileInfo, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("failed to access path: %w", err)
-	}
-
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, parallelism)
-
-	if fileInfo.IsDir() {
-		printf("\033[36mChecking directory:\033[0m %s\n", path)
-		dirGhostPath := filepath.Join(path, ".ghost")
-
-		if recursive {
-			err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-
-				if !d.IsDir() && filepath.Base(filePath) != ".ghost" {
-					wg.Add(1)
-					sem <- struct{}{}
-					go func(filePath string) {
-						defer wg.Done()
-						defer func() { <-sem }()
-						dirPath := filepath.Dir(filePath)
-						localGhostPath := filepath.Join(dirPath, ".ghost")
-						if err := checkF(filePath, localGhostPath); err != nil {
-							printf("\033[31mError: %v\033[0m\n", err)
-						}
-					}(filePath)
-				}
-				return nil
-			})
-			if err != nil {
-				return fmt.Errorf("error checking directory recursively: %w", err)
-			}
-		} else {
-			files, err := os.ReadDir(path)
-			if err != nil {
-				return fmt.Errorf("failed to read directory: %w", err)
-			}
-
-			for _, file := range files {
-				if !file.IsDir() && file.Name() != ".ghost" {
-					wg.Add(1)
-					sem <- struct{}{}
-					go func(file os.DirEntry) {
-						defer wg.Done()
-						defer func() { <-sem }()
-						filePath := filepath.Join(path, file.Name())
-						if err := checkF(filePath, dirGhostPath); err != nil {
-							printf("\033[31mError: %v\033[0m\n", err)
-						}
-					}(file)
-				}
-			}
-		}
-
-		wg.Wait()
-		return nil
-	}
-
-	dirPath := filepath.Dir(path)
-	fileGhostPath := filepath.Join(dirPath, ".ghost")
-
-	return checkF(path, fileGhostPath)
+	return processFiles(path, recursive, checkF)
 }
 
 func cleanF(dirPath string, ghostPath string) error {
@@ -537,65 +418,7 @@ func cleanF(dirPath string, ghostPath string) error {
 }
 
 func clean(path string, recursive bool) error {
-	fileInfo, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("failed to access path: %w", err)
-	}
-
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, parallelism)
-
-	if fileInfo.IsDir() {
-		printf("\033[36mCleaning directory:\033[0m %s\n", path)
-		dirGhostPath := filepath.Join(path, ".ghost")
-
-		if _, err := os.Stat(dirGhostPath); !os.IsNotExist(err) {
-			if err := cleanF(path, dirGhostPath); err != nil {
-				return fmt.Errorf("error cleaning ghost file: %w", err)
-			}
-		} else {
-			printf("\033[33mNo ghost file found at:\033[0m %s\n", dirGhostPath)
-		}
-
-		if recursive {
-			err := filepath.WalkDir(path, func(subPath string, d fs.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-
-				if d.IsDir() && subPath != path {
-					wg.Add(1)
-					sem <- struct{}{}
-					go func(subPath string) {
-						defer wg.Done()
-						defer func() { <-sem }()
-						subGhostPath := filepath.Join(subPath, ".ghost")
-						if _, err := os.Stat(subGhostPath); !os.IsNotExist(err) {
-							if err := cleanF(subPath, subGhostPath); err != nil {
-								printf("\033[31mError cleaning %s: %v\033[0m\n", subPath, err)
-							}
-						}
-					}(subPath)
-				}
-				return nil
-			})
-			if err != nil {
-				return fmt.Errorf("error processing directory recursively: %w", err)
-			}
-		}
-
-		wg.Wait()
-		return nil
-	}
-
-	dirPath := filepath.Dir(path)
-	fileGhostPath := filepath.Join(dirPath, ".ghost")
-
-	if _, err := os.Stat(fileGhostPath); os.IsNotExist(err) {
-		return fmt.Errorf("no ghost file found in directory: %s", dirPath)
-	}
-
-	return cleanF(dirPath, fileGhostPath)
+	return processFiles(path, recursive, cleanF)
 }
 
 func printSummary() {
@@ -622,6 +445,7 @@ func help() {
 	fmt.Println("  \033[38;5;148m-r\033[0m      Process directories recursively")
 	fmt.Println("  \033[38;5;148m-q\033[0m      Quiet mode (for scripting)")
 	fmt.Println("  \033[38;5;148m-p N\033[0m    Number of parallel threads")
+	fmt.Println("  \033[38;5;148m-f\033[0m      Force overwrite without prompt")
 	fmt.Println()
 	fmt.Println("\033[38;5;116mExit codes:\033[0m")
 	fmt.Println("  0       Success")
@@ -638,6 +462,7 @@ func main() {
 	flag.IntVar(&parallelism, "p", 1, "Number of parallel threads")
 	flag.BoolVar(&quietMode, "q", false, "Quiet mode (for scripting)")
 	recursive := flag.Bool("r", false, "Process directories recursively")
+	forceOverwrite := flag.Bool("f", false, "Force overwrite without prompt")
 	flag.Parse()
 
 	if flag.NArg() < 2 {
@@ -651,7 +476,7 @@ func main() {
 	var err error
 	switch command {
 	case "add":
-		err = add(path, *recursive)
+		err = add(path, *recursive, *forceOverwrite)
 	case "del":
 		err = del(path, *recursive)
 	case "check":
