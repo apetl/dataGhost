@@ -1,18 +1,36 @@
 ## DataGhost
-A command-line tool for file integrity tracking using BLAKE2b hashes.
+A command-line tool for file integrity tracking using BLAKE2b hashes and human-readable YAML “ghost” files.  
+Perfect for verifying files on USB drives, backups, or any folder you care about.
 ### Usage
 ```bash
-# Add files to tracking
-dataGhost add file.txt
-dataGhost -r add .  # recursive
+$ dataGhost help
+Usage: dataGhost [OPTIONS] COMMAND
 
-# Check file integrity  
-dataGhost check file.txt
-dataGhost -q check .  # quiet mode
+Commands:
+  add     Add files to tracking
+  del     Delete tracked files
+  check   Check status of tracked files
+  clean   Clean up tracked files
 
-# Remove from tracking
-dataGhost del file.txt
+Options:
+  -r      Process directories recursively
+  -q      Quiet mode (for scripting)
+  -p N    Number of parallel threads
+  -f      Force overwrite without prompt
 
-# Clean up deleted files
-dataGhost clean .
+Exit codes:
+  0       Success
+  1       Corruption found
+  2       Error occurred
+
+Examples:
+  dataGhost add file.txt
+  dataGhost -r clean
+  dataGhost -q check .
 ```
+### Features
+- Tracks file hashes per-directory in a ```.ghost``` YAML file
+- Fast, concurrent checks (with ```-p N```)
+- Coloured, readable CLI output
+- Quiet mode for scripting (```-q```)
+- Recursive directory support (```-r```)
