@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/goccy/go-yaml"
@@ -17,6 +18,15 @@ type fileData struct {
 	Blake2b string `yaml:"Blake2b"`
 }
 
+type conf struct {
+	Ignore    []string `yaml:"ignore"`
+	Buffer    int      `yaml:"buffer"`
+	Quiet     bool     `yaml:"quiet"`
+	Parallel  int      `yaml:"parallel"`
+	Recursive bool     `yaml:"recursive"`
+	Force     bool     `yaml:"force"`
+}
+
 type stats struct {
 	checked   int
 	corrupted int
@@ -25,11 +35,15 @@ type stats struct {
 }
 
 var (
-	quietMode   bool
-	globalStats stats
-	parallelism int
-	ghostMutex  = make(map[string]*sync.Mutex)
-	mutexLock   sync.Mutex
+	quietMode    bool
+	globalStats  stats
+	parallelism  int
+	rootConfig   conf
+	strictConfig bool
+	configCache  = make(map[string]conf)
+	cacheMutex   sync.RWMutex
+	ghostMutex   = make(map[string]*sync.Mutex)
+	mutexLock    sync.Mutex
 )
 
 func getGhostMutex(ghostPath string) *sync.Mutex {
@@ -42,19 +56,183 @@ func getGhostMutex(ghostPath string) *sync.Mutex {
 	return ghostMutex[ghostPath]
 }
 
-func printf(format string, args ...interface{}) {
+func printf(format string, args ...any) {
 	if !quietMode {
 		fmt.Printf(format, args...)
 	}
 }
 
-func println(args ...interface{}) {
+func println(args ...any) {
 	if !quietMode {
 		fmt.Println(args...)
 	}
 }
 
+func getDefaultConfig() conf {
+	return conf{
+		Ignore:    []string{},
+		Buffer:    0,
+		Quiet:     false,
+		Parallel:  1,
+		Recursive: false,
+		Force:     false,
+	}
+}
+
+func loadConfigFromFile(configPath string) (conf, error) {
+	config := getDefaultConfig()
+
+	if configPath == "" {
+		return config, nil
+	}
+
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return config, nil
+	}
+
+	yamlBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		return config, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	err = yaml.Unmarshal(yamlBytes, &config)
+	if err != nil {
+		return config, fmt.Errorf("failed to parse config YAML: %w", err)
+	}
+
+	return config, nil
+}
+
+func loadConfig(configFile string, targetPath string, useConfig bool, useStrictConfig bool) error {
+	rootConfig = getDefaultConfig()
+
+	if useConfig || useStrictConfig {
+		var configPath string
+
+		if configFile != "" {
+			configPath = configFile
+		} else {
+			absTargetPath, err := filepath.Abs(targetPath)
+			if err != nil {
+				return fmt.Errorf("failed to get absolute path: %w", err)
+			}
+
+			var rootDir string
+			if stat, err := os.Stat(absTargetPath); err == nil && stat.IsDir() {
+				rootDir = absTargetPath
+			} else {
+				rootDir = filepath.Dir(absTargetPath)
+			}
+
+			configPath = filepath.Join(rootDir, ".ghostconf")
+		}
+
+		var err error
+		rootConfig, err = loadConfigFromFile(configPath)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func getConfigForPath(dirPath string) conf {
+	if strictConfig {
+		return rootConfig
+	}
+
+	cacheMutex.RLock()
+	if cached, exists := configCache[dirPath]; exists {
+		cacheMutex.RUnlock()
+		return cached
+	}
+	cacheMutex.RUnlock()
+
+	config := rootConfig
+	localConfigPath := filepath.Join(dirPath, ".ghostconf")
+
+	if localConfig, err := loadConfigFromFile(localConfigPath); err == nil {
+		config.Ignore = localConfig.Ignore
+	}
+
+	cacheMutex.Lock()
+	configCache[dirPath] = config
+	cacheMutex.Unlock()
+
+	return config
+}
+
+func shouldIgnore(filePath string, basePath string) bool {
+	dirPath := filepath.Dir(filePath)
+	config := getConfigForPath(dirPath)
+
+	if len(config.Ignore) == 0 {
+		return false
+	}
+
+	relPath, err := filepath.Rel(basePath, filePath)
+	if err != nil {
+		relPath = filepath.Base(filePath)
+	}
+
+	relPath = filepath.ToSlash(relPath)
+	fileName := filepath.Base(filePath)
+
+	for _, pattern := range config.Ignore {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" || strings.HasPrefix(pattern, "#") {
+			continue
+		}
+
+		pattern = filepath.ToSlash(pattern)
+
+		if matchesPattern(relPath, pattern) || matchesPattern(fileName, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func matchesPattern(path, pattern string) bool {
+	if path == pattern {
+		return true
+	}
+
+	if strings.HasSuffix(pattern, "/") {
+		dirPattern := strings.TrimSuffix(pattern, "/")
+		if strings.HasPrefix(path, dirPattern+"/") || path == dirPattern {
+			return true
+		}
+	}
+
+	if strings.Contains(pattern, "*") {
+		matched, _ := filepath.Match(pattern, path)
+		if matched {
+			return true
+		}
+		pathParts := strings.Split(path, "/")
+		for i := range pathParts {
+			partialPath := strings.Join(pathParts[:i+1], "/")
+			if matched, _ := filepath.Match(pattern, partialPath); matched {
+				return true
+			}
+		}
+	}
+
+	if strings.Contains(path, pattern) {
+		return true
+	}
+
+	return false
+}
+
 func getBufferSize(file *os.File) int {
+	if rootConfig.Buffer > 0 {
+		return rootConfig.Buffer
+	}
+
 	const (
 		minBuffer     = 64 * 1024
 		maxBuffer     = 1024 * 1024
@@ -147,8 +325,13 @@ func writeGhost(data map[string]fileData, ghostPath string) error {
 	return nil
 }
 
-func addF(filePath string, ghostPath string, forceOverwrite bool) error {
+func addF(filePath string, ghostPath string, forceOverwrite bool, basePath string) error {
 	filename := filepath.Base(filePath)
+
+	if shouldIgnore(filePath, basePath) {
+		printf("\033[33mIgnoring file:\033[0m %s\n", filePath)
+		return nil
+	}
 
 	currentHash, err := calcHash(filePath)
 	if err != nil {
@@ -199,7 +382,7 @@ func addF(filePath string, ghostPath string, forceOverwrite bool) error {
 	return writeGhost(data, ghostPath)
 }
 
-func processFiles(path string, recursive bool, operation func(string, string) error) error {
+func processFiles(path string, recursive bool, operation func(string, string, string) error) error {
 	fileInfo, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to access path: %w", err)
@@ -218,7 +401,7 @@ func processFiles(path string, recursive bool, operation func(string, string) er
 					return err
 				}
 
-				if !d.IsDir() && filepath.Base(filePath) != ".ghost" {
+				if !d.IsDir() && filepath.Base(filePath) != ".ghost" && filepath.Base(filePath) != ".ghostconf" {
 					wg.Add(1)
 					sem <- struct{}{}
 					go func(filePath string) {
@@ -226,7 +409,7 @@ func processFiles(path string, recursive bool, operation func(string, string) er
 						defer func() { <-sem }()
 						dirPath := filepath.Dir(filePath)
 						localGhostPath := filepath.Join(dirPath, ".ghost")
-						if err := operation(filePath, localGhostPath); err != nil {
+						if err := operation(filePath, localGhostPath, path); err != nil {
 							printf("\033[33mWarning: %v\033[0m\n", err)
 						}
 					}(filePath)
@@ -243,14 +426,14 @@ func processFiles(path string, recursive bool, operation func(string, string) er
 			}
 
 			for _, file := range files {
-				if !file.IsDir() && file.Name() != ".ghost" {
+				if !file.IsDir() && file.Name() != ".ghost" && file.Name() != ".ghostconf" {
 					wg.Add(1)
 					sem <- struct{}{}
 					go func(file os.DirEntry) {
 						defer wg.Done()
 						defer func() { <-sem }()
 						filePath := filepath.Join(path, file.Name())
-						if err := operation(filePath, dirGhostPath); err != nil {
+						if err := operation(filePath, dirGhostPath, path); err != nil {
 							printf("\033[33mWarning: %v\033[0m\n", err)
 						}
 					}(file)
@@ -266,7 +449,7 @@ func processFiles(path string, recursive bool, operation func(string, string) er
 	dirPath := filepath.Dir(path)
 	fileGhostPath := filepath.Join(dirPath, ".ghost")
 
-	err = operation(path, fileGhostPath)
+	err = operation(path, fileGhostPath, dirPath)
 	if err != nil {
 		return err
 	}
@@ -276,12 +459,12 @@ func processFiles(path string, recursive bool, operation func(string, string) er
 }
 
 func add(path string, recursive bool, forceOverwrite bool) error {
-	return processFiles(path, recursive, func(filePath, ghostPath string) error {
-		return addF(filePath, ghostPath, forceOverwrite)
+	return processFiles(path, recursive, func(filePath, ghostPath, basePath string) error {
+		return addF(filePath, ghostPath, forceOverwrite, basePath)
 	})
 }
 
-func delF(filePath string, ghostPath string) error {
+func delF(filePath string, ghostPath string, basePath string) error {
 	filename := filepath.Base(filePath)
 
 	mutex := getGhostMutex(ghostPath)
@@ -309,8 +492,12 @@ func del(path string, recursive bool) error {
 	return processFiles(path, recursive, delF)
 }
 
-func checkF(filePath string, ghostPath string) error {
+func checkF(filePath string, ghostPath string, basePath string) error {
 	filename := filepath.Base(filePath)
+
+	if shouldIgnore(filePath, basePath) {
+		return nil
+	}
 
 	currentHash, err := calcHash(filePath)
 	if err != nil {
@@ -357,7 +544,7 @@ func check(path string, recursive bool) error {
 	return processFiles(path, recursive, checkF)
 }
 
-func cleanF(dirPath string, ghostPath string) error {
+func cleanF(dirPath string, ghostPath string, basePath string) error {
 	mutex := getGhostMutex(ghostPath)
 	mutex.Lock()
 	defer mutex.Unlock()
@@ -416,10 +603,18 @@ func help() {
 	fmt.Println("  \033[38;5;117mclean\033[0m   Clean up tracked files")
 	fmt.Println()
 	fmt.Println("\033[38;5;116mOptions:\033[0m")
-	fmt.Println("  \033[38;5;148m-r\033[0m      Process directories recursively")
-	fmt.Println("  \033[38;5;148m-q\033[0m      Quiet mode (for scripting)")
-	fmt.Println("  \033[38;5;148m-p N\033[0m    Number of parallel threads")
-	fmt.Println("  \033[38;5;148m-f\033[0m      Force overwrite without prompt")
+	fmt.Println("  \033[38;5;148m-c\033[0m          Load .ghostconf from target directory")
+	fmt.Println("  \033[38;5;148m-cs\033[0m         Load .ghostconf from target directory (strict mode)")
+	fmt.Println("  \033[38;5;148m-cf FILE\033[0m    Load config from specified file")
+	fmt.Println("  \033[38;5;148m-csf FILE\033[0m   Load config from specified file (strict mode)")
+	fmt.Println("  \033[38;5;148m-r\033[0m          Process directories recursively")
+	fmt.Println("  \033[38;5;148m-q\033[0m          Quiet mode (for scripting)")
+	fmt.Println("  \033[38;5;148m-p N\033[0m        Number of parallel threads")
+	fmt.Println("  \033[38;5;148m-f\033[0m          Force overwrite without prompt")
+	fmt.Println()
+	fmt.Println("\033[38;5;116mConfig modes:\033[0m")
+	fmt.Println("  Normal: Allows subdirectory .ghostconf files to override ignore rules")
+	fmt.Println("  Strict: Uses only the root config ignore rules for all subdirectories")
 	fmt.Println()
 	fmt.Println("\033[38;5;116mExit codes:\033[0m")
 	fmt.Println("  0       Success")
@@ -430,9 +625,32 @@ func help() {
 	fmt.Println("  dataGhost \033[38;5;117madd\033[0m file.txt")
 	fmt.Println("  dataGhost \033[38;5;148m-r\033[0m \033[38;5;117mclean\033[0m")
 	fmt.Println("  dataGhost \033[38;5;148m-q\033[0m \033[38;5;117mcheck\033[0m .")
+	fmt.Println("  dataGhost \033[38;5;148m-c\033[0m \033[38;5;117madd\033[0m . (loads .ghostconf from target dir)")
+	fmt.Println("  dataGhost \033[38;5;148m-cf config.yaml\033[0m \033[38;5;117madd\033[0m .")
+	fmt.Println("  dataGhost \033[38;5;148m-cs\033[0m \033[38;5;117madd\033[0m . (strict mode with .ghostconf)")
+	fmt.Println("  dataGhost \033[38;5;148m-csf config.yaml\033[0m \033[38;5;117madd\033[0m . (strict mode with custom config)")
+	fmt.Println()
+	fmt.Println("\033[38;5;116mConfig file example (.ghostconf):\033[0m")
+	fmt.Println("  ignore:")
+	fmt.Println("    - \"*.tmp\"")
+	fmt.Println("    - \"*.log\"")
+	fmt.Println("    - \"node_modules/\"")
+	fmt.Println("    - \".git/\"")
+	fmt.Println("  buffer: 262144")
+	fmt.Println("  parallel: 4")
+	fmt.Println("  quiet: false")
 }
 
 func main() {
+	var useConfig bool
+	var useStrictConfig bool
+	var configFile string
+	var strictConfigFile string
+
+	flag.BoolVar(&useConfig, "c", false, "Load .ghostconf from target directory")
+	flag.BoolVar(&useStrictConfig, "cs", false, "Load .ghostconf from target directory (strict mode)")
+	flag.StringVar(&configFile, "cf", "", "Load config from specified file")
+	flag.StringVar(&strictConfigFile, "csf", "", "Load config from specified file (strict mode)")
 	flag.IntVar(&parallelism, "p", 1, "Number of parallel threads")
 	flag.BoolVar(&quietMode, "q", false, "Quiet mode (for scripting)")
 	recursive := flag.Bool("r", false, "Process directories recursively")
@@ -446,6 +664,51 @@ func main() {
 
 	command := flag.Arg(0)
 	path := flag.Arg(1)
+
+	finalConfigFile := ""
+	useAnyConfig := false
+
+	if strictConfigFile != "" {
+		strictConfig = true
+		finalConfigFile = strictConfigFile
+		useAnyConfig = true
+	} else if configFile != "" {
+		finalConfigFile = configFile
+		useAnyConfig = true
+	} else if useStrictConfig {
+		strictConfig = true
+		useAnyConfig = true
+	} else if useConfig {
+		useAnyConfig = true
+	}
+
+	if err := loadConfig(finalConfigFile, path, useAnyConfig, useAnyConfig); err != nil {
+		fmt.Printf("\033[38;5;204mError loading config: %v\033[0m\n", err)
+		os.Exit(2)
+	}
+
+	if flag.Lookup("p").Value.String() != "1" {
+		rootConfig.Parallel = parallelism
+	} else {
+		parallelism = rootConfig.Parallel
+	}
+
+	if flag.Lookup("q").Value.String() == "true" {
+		rootConfig.Quiet = true
+	}
+	quietMode = rootConfig.Quiet
+
+	if flag.Lookup("r").Value.String() == "true" {
+		rootConfig.Recursive = true
+	} else {
+		*recursive = rootConfig.Recursive
+	}
+
+	if flag.Lookup("f").Value.String() == "true" {
+		rootConfig.Force = true
+	} else {
+		*forceOverwrite = rootConfig.Force
+	}
 
 	var err error
 	switch command {
@@ -474,3 +737,4 @@ func main() {
 
 	os.Exit(0)
 }
+
