@@ -164,8 +164,7 @@ func getConfigForPath(dirPath string) conf {
 }
 
 func shouldIgnore(filePath string, basePath string) bool {
-	dirPath := filepath.Dir(filePath)
-	config := getConfigForPath(dirPath)
+	config := getConfigForPath(basePath)
 
 	if len(config.Ignore) == 0 {
 		return false
@@ -354,7 +353,7 @@ func addF(filePath string, ghostPath string, forceOverwrite bool, basePath strin
 			printf("\033[36mFilename:\033[0m %s\n", filename)
 			printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
 			printf("\033[36mStored hash:\033[0m %s\n", storedHash)
-			println("\033[32mStatus: Hashes match ✓\033[0m")
+			println("\033[32mStatus: Hashes match Γ£ô\033[0m")
 			return nil
 		} else if !forceOverwrite {
 			printf("\033[33mWarning:\033[0m File '%s' already exists in ghost with a different hash.\n", filename)
@@ -531,10 +530,10 @@ func checkF(filePath string, ghostPath string, basePath string) error {
 
 	if currentHash == storedHash {
 		globalStats.ok++
-		println("\033[32mStatus: Hashes match ✓\033[0m")
+		println("\033[32mStatus: Hashes match Γ£ô\033[0m")
 	} else {
 		globalStats.corrupted++
-		println("\033[31mStatus: Hashes differ ✗\033[0m")
+		println("\033[31mStatus: Hashes differ Γ£ù\033[0m")
 	}
 
 	return nil
