@@ -9,33 +9,60 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/goccy/go-yaml"
 	"golang.org/x/crypto/blake2b"
 )
 
+// fileData stores metadata about tracked files
 type fileData struct {
-	Blake2b string `yaml:"Blake2b"`
+	Blake2b  string    `yaml:"Blake2b"`
+	Size     int64     `yaml:"size,omitempty"`
+	Modified time.Time `yaml:"modified,omitempty"`
 }
 
+// conf represents configuration settings
 type conf struct {
-	Ignore    []string `yaml:"ignore"`
-	Buffer    int      `yaml:"buffer"`
-	Quiet     bool     `yaml:"quiet"`
-	Parallel  int      `yaml:"parallel"`
-	Recursive bool     `yaml:"recursive"`
-	Force     bool     `yaml:"force"`
+	Ignore       []string `yaml:"ignore"`
+	Buffer       int      `yaml:"buffer"`
+	Quiet        bool     `yaml:"quiet"`
+	Parallel     int      `yaml:"parallel"`
+	Recursive    bool     `yaml:"recursive"`
+	Force        bool     `yaml:"force"`
+	ShowProgress bool     `yaml:"show_progress"`
 }
 
+// stats tracks operation statistics
 type stats struct {
-	checked   int
-	corrupted int
-	ok        int
-	errors    int
+	checked   int64
+	corrupted int64
+	ok        int64
+	errors    int64
+	skipped   int64
+	added     int64
+	deleted   int64
+	modified  int64
+	updated   int64
 }
+
+// Color codes for terminal output
+const (
+	colorReset   = "\033[0m"
+	colorRed     = "\033[31m"
+	colorGreen   = "\033[32m"
+	colorYellow  = "\033[33m"
+	colorBlue    = "\033[34m"
+	colorMagenta = "\033[35m"
+	colorCyan    = "\033[36m"
+	colorGray    = "\033[90m"
+)
 
 var (
 	quietMode    bool
+	showProgress bool
+	forceCheck   bool
 	globalStats  stats
 	parallelism  int
 	rootConfig   conf
@@ -44,8 +71,10 @@ var (
 	cacheMutex   sync.RWMutex
 	ghostMutex   = make(map[string]*sync.Mutex)
 	mutexLock    sync.Mutex
+	startTime    time.Time
 )
 
+// getGhostMutex returns or creates a mutex for a specific ghost file
 func getGhostMutex(ghostPath string) *sync.Mutex {
 	mutexLock.Lock()
 	defer mutexLock.Unlock()
@@ -56,29 +85,52 @@ func getGhostMutex(ghostPath string) *sync.Mutex {
 	return ghostMutex[ghostPath]
 }
 
+// printf prints formatted output unless in quiet mode
 func printf(format string, args ...any) {
 	if !quietMode {
 		fmt.Printf(format, args...)
 	}
 }
 
+// println prints output unless in quiet mode
 func println(args ...any) {
 	if !quietMode {
 		fmt.Println(args...)
 	}
 }
 
+// printProgress displays a progress indicator
+func printProgress(current, total int64, operation string) {
+	if !showProgress || quietMode {
+		return
+	}
+	percentage := float64(current) / float64(total) * 100
+	fmt.Printf("\r%s[%s] Processing: %d/%d (%.1f%%)%s",
+		colorCyan, operation, current, total, percentage, colorReset)
+}
+
+// clearProgress clears the progress line
+func clearProgress() {
+	if !showProgress || quietMode {
+		return
+	}
+	fmt.Print("\r\033[K")
+}
+
+// getDefaultConfig returns default configuration settings
 func getDefaultConfig() conf {
 	return conf{
-		Ignore:    []string{},
-		Buffer:    0,
-		Quiet:     false,
-		Parallel:  1,
-		Recursive: false,
-		Force:     false,
+		Ignore:       []string{},
+		Buffer:       0,
+		Quiet:        false,
+		Parallel:     1,
+		Recursive:    false,
+		Force:        false,
+		ShowProgress: true,
 	}
 }
 
+// loadConfigFromFile loads configuration from a YAML file
 func loadConfigFromFile(configPath string) (conf, error) {
 	config := getDefaultConfig()
 
@@ -92,17 +144,18 @@ func loadConfigFromFile(configPath string) (conf, error) {
 
 	yamlBytes, err := os.ReadFile(configPath)
 	if err != nil {
-		return config, fmt.Errorf("failed to read config file: %w", err)
+		return config, fmt.Errorf("failed to read config file '%s': %w", configPath, err)
 	}
 
 	err = yaml.Unmarshal(yamlBytes, &config)
 	if err != nil {
-		return config, fmt.Errorf("failed to parse config YAML: %w", err)
+		return config, fmt.Errorf("failed to parse config YAML from '%s': %w", configPath, err)
 	}
 
 	return config, nil
 }
 
+// loadConfig loads the root configuration
 func loadConfig(configFile string, targetPath string, useConfig bool, useStrictConfig bool) error {
 	rootConfig = getDefaultConfig()
 
@@ -114,7 +167,7 @@ func loadConfig(configFile string, targetPath string, useConfig bool, useStrictC
 		} else {
 			absTargetPath, err := filepath.Abs(targetPath)
 			if err != nil {
-				return fmt.Errorf("failed to get absolute path: %w", err)
+				return fmt.Errorf("failed to get absolute path for '%s': %w", targetPath, err)
 			}
 
 			var rootDir string
@@ -137,6 +190,7 @@ func loadConfig(configFile string, targetPath string, useConfig bool, useStrictC
 	return nil
 }
 
+// getConfigForPath retrieves configuration for a specific directory path
 func getConfigForPath(dirPath string) conf {
 	if strictConfig {
 		return rootConfig
@@ -163,6 +217,7 @@ func getConfigForPath(dirPath string) conf {
 	return config
 }
 
+// shouldIgnore checks if a file should be ignored based on patterns
 func shouldIgnore(filePath string, basePath string) bool {
 	config := getConfigForPath(basePath)
 
@@ -194,6 +249,7 @@ func shouldIgnore(filePath string, basePath string) bool {
 	return false
 }
 
+// matchesPattern checks if a path matches a given pattern
 func matchesPattern(path, pattern string) bool {
 	if path == pattern {
 		return true
@@ -227,6 +283,7 @@ func matchesPattern(path, pattern string) bool {
 	return false
 }
 
+// getBufferSize determines optimal buffer size for file reading
 func getBufferSize(file *os.File) int {
 	if rootConfig.Buffer > 0 {
 		return rootConfig.Buffer
@@ -255,10 +312,14 @@ func getBufferSize(file *os.File) int {
 	}
 }
 
+// calcHash computes the BLAKE2b hash of a file
 func calcHash(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("failed to open file: %w", err)
+		if os.IsPermission(err) {
+			return "", fmt.Errorf("permission denied: ensure you have read access to '%s'", path)
+		}
+		return "", fmt.Errorf("failed to open file '%s': %w", path, err)
 	}
 	defer file.Close()
 
@@ -273,7 +334,7 @@ func calcHash(path string) (string, error) {
 		bytesRead, err := file.Read(buffer)
 		if err != nil {
 			if err != io.EOF {
-				return "", fmt.Errorf("failed to read file: %w", err)
+				return "", fmt.Errorf("failed to read file '%s': %w", path, err)
 			}
 			break
 		}
@@ -286,6 +347,7 @@ func calcHash(path string) (string, error) {
 	return fmt.Sprintf("%x", hashSum), nil
 }
 
+// readGhost reads the ghost file and returns tracked file data
 func readGhost(ghostPath string) (map[string]fileData, error) {
 	data := make(map[string]fileData)
 
@@ -295,7 +357,7 @@ func readGhost(ghostPath string) (map[string]fileData, error) {
 
 	yamlBytes, err := os.ReadFile(ghostPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read ghost file: %w", err)
+		return nil, fmt.Errorf("failed to read ghost file '%s': %w", ghostPath, err)
 	}
 
 	if len(yamlBytes) == 0 {
@@ -304,37 +366,69 @@ func readGhost(ghostPath string) (map[string]fileData, error) {
 
 	err = yaml.Unmarshal(yamlBytes, &data)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse YAML: %w", err)
+		return nil, fmt.Errorf("failed to parse YAML from '%s': %w", ghostPath, err)
 	}
 
 	return data, nil
 }
 
+// writeGhost writes tracked file data to the ghost file atomically
 func writeGhost(data map[string]fileData, ghostPath string) error {
 	yamlBytes, err := yaml.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal YAML: %w", err)
 	}
 
-	err = os.WriteFile(ghostPath, yamlBytes, 0644)
+	// Write to temporary file first for atomicity
+	tmpPath := ghostPath + ".tmp"
+	err = os.WriteFile(tmpPath, yamlBytes, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
+		return fmt.Errorf("failed to write temporary file: %w", err)
+	}
+
+	// Rename temporary file to actual ghost file
+	err = os.Rename(tmpPath, ghostPath)
+	if err != nil {
+		os.Remove(tmpPath) // Clean up on error
+		return fmt.Errorf("failed to finalize ghost file: %w", err)
 	}
 
 	return nil
 }
 
+// needsRehash checks if a file needs rehashing based on modification time and size
+func needsRehash(filePath string, stored fileData) bool {
+	stat, err := os.Stat(filePath)
+	if err != nil {
+		return true // If we can't stat, we need to rehash
+	}
+
+	// Check if size or modification time changed
+	if stat.Size() != stored.Size || !stat.ModTime().Equal(stored.Modified) {
+		return true
+	}
+
+	return false
+}
+
+// addF adds or updates a file in the ghost database
 func addF(filePath string, ghostPath string, forceOverwrite bool, basePath string) error {
 	filename := filepath.Base(filePath)
 
 	if shouldIgnore(filePath, basePath) {
-		printf("\033[33mIgnoring file:\033[0m %s\n", filePath)
+		printf("%s[IGNORE]%s %s\n", colorYellow, colorReset, filePath)
+		atomic.AddInt64(&globalStats.skipped, 1)
 		return nil
+	}
+
+	stat, err := os.Stat(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to access file '%s': %w", filePath, err)
 	}
 
 	currentHash, err := calcHash(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to calculate hash: %w", err)
+		return fmt.Errorf("failed to calculate hash for '%s': %w", filePath, err)
 	}
 
 	mutex := getGhostMutex(ghostPath)
@@ -350,16 +444,13 @@ func addF(filePath string, ghostPath string, forceOverwrite bool, basePath strin
 	if exists {
 		storedHash := storedData.Blake2b
 		if currentHash == storedHash {
-			printf("\033[36mFilename:\033[0m %s\n", filename)
-			printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
-			printf("\033[36mStored hash:\033[0m %s\n", storedHash)
-			println("\033[32mStatus: Hashes match Γ£ô\033[0m")
+			printf("%s[UNCHANGED]%s %s\n", colorGray, colorReset, filename)
 			return nil
 		} else if !forceOverwrite {
-			printf("\033[33mWarning:\033[0m File '%s' already exists in ghost with a different hash.\n", filename)
-			printf("Existing hash: %s\n", storedHash)
-			printf("New hash: %s\n", currentHash)
-			printf("Do you want to overwrite it? (y/n): ")
+			printf("%s[WARNING]%s File '%s' already tracked with different hash\n", colorYellow, colorReset, filename)
+			printf("  Existing: %s\n", storedHash)
+			printf("  Current:  %s\n", currentHash)
+			printf("  Overwrite? (y/n): ")
 
 			var response string
 			fmt.Scanln(&response)
@@ -368,36 +459,54 @@ func addF(filePath string, ghostPath string, forceOverwrite bool, basePath strin
 				return fmt.Errorf("operation cancelled by user")
 			}
 		}
+		atomic.AddInt64(&globalStats.modified, 1)
+		printf("%s[UPDATED]%s %s\n", colorBlue, colorReset, filename)
+	} else {
+		atomic.AddInt64(&globalStats.added, 1)
+		printf("%s[ADDED]%s %s\n", colorGreen, colorReset, filename)
 	}
 
 	data[filename] = fileData{
-		Blake2b: currentHash,
+		Blake2b:  currentHash,
+		Size:     stat.Size(),
+		Modified: stat.ModTime(),
 	}
-
-	printf("\033[32mFile Added to Ghost:\033[0m\n")
-	printf("\033[36mFilename:\033[0m %s\n", filename)
-	printf("\033[36mBlake2b Hash:\033[0m %s\n", currentHash)
 
 	return writeGhost(data, ghostPath)
 }
 
-func processFiles(path string, recursive bool, operation func(string, string, string) error) error {
+// processFiles handles file processing with concurrency control
+func processFiles(path string, recursive bool, operation func(string, string, string) error, operationName string) error {
 	fileInfo, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("failed to access path: %w", err)
+		return fmt.Errorf("failed to access path '%s': %w", path, err)
 	}
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, parallelism)
+	var totalFiles int64
 
 	if fileInfo.IsDir() {
-		printf("\033[36mProcessing directory:\033[0m %s\n", path)
+		printf("%s[PROCESSING]%s Directory: %s\n", colorCyan, colorReset, path)
 		dirGhostPath := filepath.Join(path, ".ghost")
+
+		// Count files first for progress indication
+		if showProgress {
+			filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
+				if err == nil && !d.IsDir() && filepath.Base(filePath) != ".ghost" && filepath.Base(filePath) != ".ghostconf" {
+					atomic.AddInt64(&totalFiles, 1)
+				}
+				return nil
+			})
+		}
+
+		var processed int64
 
 		if recursive {
 			err := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
 				if err != nil {
-					return err
+					printf("%s[ERROR]%s Walking directory: %v\n", colorRed, colorReset, err)
+					return nil // Continue walking despite errors
 				}
 
 				if !d.IsDir() && filepath.Base(filePath) != ".ghost" && filepath.Base(filePath) != ".ghostconf" {
@@ -406,10 +515,18 @@ func processFiles(path string, recursive bool, operation func(string, string, st
 					go func(filePath string) {
 						defer wg.Done()
 						defer func() { <-sem }()
+
+						current := atomic.AddInt64(&processed, 1)
+						if showProgress && totalFiles > 0 {
+							printProgress(current, totalFiles, operationName)
+						}
+
 						dirPath := filepath.Dir(filePath)
 						localGhostPath := filepath.Join(dirPath, ".ghost")
 						if err := operation(filePath, localGhostPath, path); err != nil {
-							printf("\033[33mWarning: %v\033[0m\n", err)
+							clearProgress()
+							printf("%s[ERROR]%s %v\n", colorRed, colorReset, err)
+							atomic.AddInt64(&globalStats.errors, 1)
 						}
 					}(filePath)
 				}
@@ -421,7 +538,7 @@ func processFiles(path string, recursive bool, operation func(string, string, st
 		} else {
 			files, err := os.ReadDir(path)
 			if err != nil {
-				return fmt.Errorf("failed to read directory: %w", err)
+				return fmt.Errorf("failed to read directory '%s': %w", path, err)
 			}
 
 			for _, file := range files {
@@ -431,9 +548,17 @@ func processFiles(path string, recursive bool, operation func(string, string, st
 					go func(file os.DirEntry) {
 						defer wg.Done()
 						defer func() { <-sem }()
+
+						current := atomic.AddInt64(&processed, 1)
+						if showProgress && totalFiles > 0 {
+							printProgress(current, totalFiles, operationName)
+						}
+
 						filePath := filepath.Join(path, file.Name())
 						if err := operation(filePath, dirGhostPath, path); err != nil {
-							printf("\033[33mWarning: %v\033[0m\n", err)
+							clearProgress()
+							printf("%s[ERROR]%s %v\n", colorRed, colorReset, err)
+							atomic.AddInt64(&globalStats.errors, 1)
 						}
 					}(file)
 				}
@@ -441,7 +566,8 @@ func processFiles(path string, recursive bool, operation func(string, string, st
 		}
 
 		wg.Wait()
-		printf("\033[36mSaved to:\033[0m %s\n", dirGhostPath)
+		clearProgress()
+		printf("%s[SAVED]%s Ghost file: %s\n", colorGreen, colorReset, dirGhostPath)
 		return nil
 	}
 
@@ -453,16 +579,18 @@ func processFiles(path string, recursive bool, operation func(string, string, st
 		return err
 	}
 
-	printf("\033[36mSaved to:\033[0m %s\n", fileGhostPath)
+	printf("%s[SAVED]%s Ghost file: %s\n", colorGreen, colorReset, fileGhostPath)
 	return nil
 }
 
+// add adds files to tracking
 func add(path string, recursive bool, forceOverwrite bool) error {
 	return processFiles(path, recursive, func(filePath, ghostPath, basePath string) error {
 		return addF(filePath, ghostPath, forceOverwrite, basePath)
-	})
+	}, "add")
 }
 
+// delF removes a file from the ghost database
 func delF(filePath string, ghostPath string, basePath string) error {
 	filename := filepath.Base(filePath)
 
@@ -476,32 +604,29 @@ func delF(filePath string, ghostPath string, basePath string) error {
 	}
 
 	if _, exists := data[filename]; !exists {
-		return fmt.Errorf("file %s not found in ghost", filename)
+		return fmt.Errorf("file '%s' not found in ghost", filename)
 	}
 
 	delete(data, filename)
+	atomic.AddInt64(&globalStats.deleted, 1)
 
-	printf("\033[32mFile Removed from Ghost:\033[0m\n")
-	printf("\033[36mFilename:\033[0m %s\n", filename)
+	printf("%s[DELETED]%s %s\n", colorRed, colorReset, filename)
 
 	return writeGhost(data, ghostPath)
 }
 
+// del removes files from tracking
 func del(path string, recursive bool) error {
-	return processFiles(path, recursive, delF)
+	return processFiles(path, recursive, delF, "delete")
 }
 
+// checkF verifies a file's integrity against the ghost database
 func checkF(filePath string, ghostPath string, basePath string) error {
 	filename := filepath.Base(filePath)
 
 	if shouldIgnore(filePath, basePath) {
+		atomic.AddInt64(&globalStats.skipped, 1)
 		return nil
-	}
-
-	currentHash, err := calcHash(filePath)
-	if err != nil {
-		globalStats.errors++
-		return fmt.Errorf("failed to calculate hash: %w", err)
 	}
 
 	mutex := getGhostMutex(ghostPath)
@@ -510,39 +635,53 @@ func checkF(filePath string, ghostPath string, basePath string) error {
 	mutex.Unlock()
 
 	if err != nil {
-		globalStats.errors++
+		atomic.AddInt64(&globalStats.errors, 1)
 		return err
 	}
 
-	globalStats.checked++
-
 	storedData, exists := data[filename]
 	if !exists {
-		printf("\033[33mFile '%s' not found in ghost.\033[0m\n", filename)
-		printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
+		printf("%s[NOT TRACKED]%s %s\n", colorYellow, colorReset, filename)
 		return nil
 	}
 
+	// Optimization: Skip hashing if file hasn't changed (unless force check is enabled)
+	if !forceCheck && !needsRehash(filePath, storedData) {
+		atomic.AddInt64(&globalStats.checked, 1)
+		atomic.AddInt64(&globalStats.ok, 1)
+		printf("%s[OK]%s %s %s(cached)%s\n", colorGreen, colorReset, filename, colorGray, colorReset)
+		return nil
+	}
+
+	currentHash, err := calcHash(filePath)
+	if err != nil {
+		atomic.AddInt64(&globalStats.errors, 1)
+		return fmt.Errorf("failed to calculate hash for '%s': %w", filePath, err)
+	}
+
+	atomic.AddInt64(&globalStats.checked, 1)
+
 	storedHash := storedData.Blake2b
-	printf("\033[36mFilename:\033[0m %s\n", filename)
-	printf("\033[36mCurrent hash:\033[0m %s\n", currentHash)
-	printf("\033[36mStored hash:\033[0m %s\n", storedHash)
 
 	if currentHash == storedHash {
-		globalStats.ok++
-		println("\033[32mStatus: Hashes match Γ£ô\033[0m")
+		atomic.AddInt64(&globalStats.ok, 1)
+		printf("%s[OK]%s %s\n", colorGreen, colorReset, filename)
 	} else {
-		globalStats.corrupted++
-		println("\033[31mStatus: Hashes differ Γ£ù\033[0m")
+		atomic.AddInt64(&globalStats.corrupted, 1)
+		printf("%s[CORRUPTED]%s %s\n", colorRed, colorReset, filename)
+		printf("  Expected: %s\n", storedHash)
+		printf("  Current:  %s\n", currentHash)
 	}
 
 	return nil
 }
 
+// check verifies file integrity
 func check(path string, recursive bool) error {
-	return processFiles(path, recursive, checkF)
+	return processFiles(path, recursive, checkF, "check")
 }
 
+// cleanF removes entries for non-existent files from ghost database
 func cleanF(dirPath string, ghostPath string, basePath string) error {
 	mutex := getGhostMutex(ghostPath)
 	mutex.Lock()
@@ -554,7 +693,7 @@ func cleanF(dirPath string, ghostPath string, basePath string) error {
 	}
 
 	if len(data) == 0 {
-		printf("\033[36mGhost file is empty at:\033[0m %s\n", ghostPath)
+		printf("%s[INFO]%s Ghost file is empty: %s\n", colorCyan, colorReset, ghostPath)
 		return nil
 	}
 
@@ -562,74 +701,250 @@ func cleanF(dirPath string, ghostPath string, basePath string) error {
 	for filename := range data {
 		filePath := filepath.Join(dirPath, filename)
 		if _, err := os.Stat(filePath); os.IsNotExist(err) {
-			printf("\033[33mMissing file:\033[0m %s\n", filename)
+			printf("%s[MISSING]%s %s\n", colorYellow, colorReset, filename)
 			delete(data, filename)
 			removedCount++
 		}
 	}
 
 	if removedCount > 0 {
-		printf("\033[32mRemoved %d missing file(s) from ghost\033[0m\n", removedCount)
+		printf("%s[CLEANED]%s Removed %d missing file(s)\n", colorGreen, colorReset, removedCount)
 		return writeGhost(data, ghostPath)
 	}
 
-	printf("\033[32mNo missing files found in ghost\033[0m\n")
+	printf("%s[OK]%s No missing files found\n", colorGreen, colorReset)
 	return nil
 }
 
+// clean removes entries for deleted files
 func clean(path string, recursive bool) error {
-	return processFiles(path, recursive, cleanF)
+	return processFiles(path, recursive, cleanF, "clean")
 }
 
-func printSummary() {
-	if globalStats.checked > 0 {
-		fmt.Printf("Checked %d files, %d corrupted, %d OK",
-			globalStats.checked, globalStats.corrupted, globalStats.ok)
-		if globalStats.errors > 0 {
-			fmt.Printf(", %d errors", globalStats.errors)
-		}
-		fmt.Println()
+// updateGhostFile updates old .ghost files to include size and modified metadata
+func updateGhostFile(ghostPath string, dirPath string) error {
+	printf("%s[UPDATING]%s Ghost file: %s\n", colorCyan, colorReset, ghostPath)
+
+	mutex := getGhostMutex(ghostPath)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	data, err := readGhost(ghostPath)
+	if err != nil {
+		return fmt.Errorf("failed to read ghost file: %w", err)
 	}
+
+	if len(data) == 0 {
+		printf("%s[INFO]%s Ghost file is empty: %s\n", colorCyan, colorReset, ghostPath)
+		return nil
+	}
+
+	updatedCount := 0
+	missingCount := 0
+	corruptedCount := 0
+
+	for filename, fileInfo := range data {
+		// Check if metadata is already present
+		if fileInfo.Size != 0 || !fileInfo.Modified.IsZero() {
+			printf("%s[SKIP]%s %s %s(already has metadata)%s\n", colorGray, colorReset, filename, colorGray, colorReset)
+			continue
+		}
+
+		filePath := filepath.Join(dirPath, filename)
+		stat, err := os.Stat(filePath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				printf("%s[MISSING]%s %s %s(file not found, keeping hash only)%s\n", colorYellow, colorReset, filename, colorGray, colorReset)
+				missingCount++
+			} else {
+				printf("%s[ERROR]%s %s: %v\n", colorRed, colorReset, filename, err)
+				atomic.AddInt64(&globalStats.errors, 1)
+			}
+			continue
+		}
+
+		// Verify hash before updating
+		printf("%s[VERIFYING]%s %s...\n", colorCyan, colorReset, filename)
+		currentHash, err := calcHash(filePath)
+		if err != nil {
+			printf("%s[ERROR]%s Failed to calculate hash for '%s': %v\n", colorRed, colorReset, filename, err)
+			atomic.AddInt64(&globalStats.errors, 1)
+			continue
+		}
+
+		// Check if hash matches
+		if currentHash != fileInfo.Blake2b {
+			printf("%s[HASH MISMATCH]%s %s %s(file has been modified, not updating)%s\n", colorRed, colorReset, filename, colorGray, colorReset)
+			printf("  Expected: %s\n", fileInfo.Blake2b)
+			printf("  Current:  %s\n", currentHash)
+			corruptedCount++
+			atomic.AddInt64(&globalStats.corrupted, 1)
+			continue
+		}
+
+		// Hash is valid, update with size and modification time
+		data[filename] = fileData{
+			Blake2b:  fileInfo.Blake2b,
+			Size:     stat.Size(),
+			Modified: stat.ModTime(),
+		}
+
+		printf("%s[UPDATED]%s %s %s(metadata added, hash verified)%s\n", colorGreen, colorReset, filename, colorGray, colorReset)
+		updatedCount++
+		atomic.AddInt64(&globalStats.updated, 1)
+	}
+
+	if updatedCount > 0 {
+		err = writeGhost(data, ghostPath)
+		if err != nil {
+			return fmt.Errorf("failed to write updated ghost file: %w", err)
+		}
+		printf("%s[SUCCESS]%s Updated %d file(s) in ghost database\n", colorGreen, colorReset, updatedCount)
+	} else {
+		printf("%s[INFO]%s No files needed updating\n", colorCyan, colorReset)
+	}
+
+	if missingCount > 0 {
+		printf("%s[WARNING]%s %d tracked file(s) not found on disk\n", colorYellow, colorReset, missingCount)
+	}
+
+	if corruptedCount > 0 {
+		printf("%s[WARNING]%s %d file(s) failed hash verification and were not updated\n", colorRed, colorReset, corruptedCount)
+	}
+
+	return nil
 }
 
+// update updates old .ghost files to include metadata
+func update(path string, recursive bool) error {
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("failed to access path '%s': %w", path, err)
+	}
+
+	if fileInfo.IsDir() {
+		if recursive {
+			// Walk directory tree and update all .ghost files
+			return filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
+				if err != nil {
+					printf("%s[ERROR]%s Walking directory: %v\n", colorRed, colorReset, err)
+					return nil
+				}
+
+				if !d.IsDir() && d.Name() == ".ghost" {
+					dirPath := filepath.Dir(filePath)
+					if err := updateGhostFile(filePath, dirPath); err != nil {
+						printf("%s[ERROR]%s %v\n", colorRed, colorReset, err)
+						atomic.AddInt64(&globalStats.errors, 1)
+					}
+					fmt.Println()
+				}
+				return nil
+			})
+		} else {
+			// Update .ghost file in the specified directory
+			ghostPath := filepath.Join(path, ".ghost")
+			if _, err := os.Stat(ghostPath); os.IsNotExist(err) {
+				return fmt.Errorf("no .ghost file found in directory: %s", path)
+			}
+			return updateGhostFile(ghostPath, path)
+		}
+	}
+
+	// If path is a .ghost file directly
+	if filepath.Base(path) == ".ghost" {
+		dirPath := filepath.Dir(path)
+		return updateGhostFile(path, dirPath)
+	}
+
+	return fmt.Errorf("path must be a directory or a .ghost file")
+}
+
+// printSummary displays operation statistics
+func printSummary() {
+	elapsed := time.Since(startTime)
+
+	fmt.Println()
+	fmt.Printf("%s╔═══════════════════════════════════════════════╗%s\n", colorCyan, colorReset)
+	fmt.Printf("%s║%s              OPERATION SUMMARY                %s║%s\n", colorCyan, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s╠═══════════════════════════════════════════════╣%s\n", colorCyan, colorReset)
+
+	if globalStats.checked > 0 {
+		fmt.Printf("%s║%s  Checked:    %s%-6d%s                           %s║%s\n",
+			colorCyan, colorReset, colorBlue, globalStats.checked, colorReset, colorCyan, colorReset)
+		fmt.Printf("%s║%s  OK:         %s%-6d%s                           %s║%s\n",
+			colorCyan, colorReset, colorGreen, globalStats.ok, colorReset, colorCyan, colorReset)
+		fmt.Printf("%s║%s  Corrupted:  %s%-6d%s                           %s║%s\n",
+			colorCyan, colorReset, colorRed, globalStats.corrupted, colorReset, colorCyan, colorReset)
+	}
+
+	if globalStats.added > 0 {
+		fmt.Printf("%s║%s  Added:      %s%-6d%s                           %s║%s\n",
+			colorCyan, colorReset, colorGreen, globalStats.added, colorReset, colorCyan, colorReset)
+	}
+
+	if globalStats.modified > 0 {
+		fmt.Printf("%s║%s  Modified:   %s%-6d%s                           %s║%s\n",
+			colorCyan, colorReset, colorBlue, globalStats.modified, colorReset, colorCyan, colorReset)
+	}
+
+	if globalStats.updated > 0 {
+		fmt.Printf("%s║%s  Updated:    %s%-6d%s                           %s║%s\n",
+			colorCyan, colorReset, colorGreen, globalStats.updated, colorReset, colorCyan, colorReset)
+	}
+
+	if globalStats.deleted > 0 {
+		fmt.Printf("%s║%s  Deleted:    %s%-6d%s                           %s║%s\n",
+			colorCyan, colorReset, colorRed, globalStats.deleted, colorReset, colorCyan, colorReset)
+	}
+
+	if globalStats.skipped > 0 {
+		fmt.Printf("%s║%s  Skipped:    %s%-6d%s                           %s║%s\n",
+			colorCyan, colorReset, colorYellow, globalStats.skipped, colorReset, colorCyan, colorReset)
+	}
+
+	if globalStats.errors > 0 {
+		fmt.Printf("%s║%s  Errors:     %s%-6d%s                           %s║%s\n",
+			colorCyan, colorReset, colorRed, globalStats.errors, colorReset, colorCyan, colorReset)
+	}
+
+	fmt.Printf("%s║%s  Duration:   %-29s    %s║%s\n",
+		colorCyan, colorReset, elapsed.Round(time.Millisecond).String(), colorCyan, colorReset)
+	fmt.Printf("%s╚═══════════════════════════════════════════════╝%s\n", colorCyan, colorReset)
+}
+
+// help displays usage information
 func help() {
-	fmt.Println("\033[38;5;183mUsage: dataGhost [OPTIONS] COMMAND\033[0m")
+	fmt.Printf("%s╔══════════════════════════════════════════════════════════╗%s\n", colorMagenta, colorReset)
+	fmt.Printf("%s║                    dataGhost v2.0                        ║%s\n", colorMagenta, colorReset)
+	fmt.Printf("%s║            File Integrity Tracking Utility               ║%s\n", colorMagenta, colorReset)
+	fmt.Printf("%s╚══════════════════════════════════════════════════════════╝%s\n\n", colorMagenta, colorReset)
+
+	fmt.Printf("%sUSAGE:%s\n", colorCyan, colorReset)
+	fmt.Println("  dataGhost [OPTIONS] COMMAND [PATH]")
 	fmt.Println()
-	fmt.Println("\033[38;5;116mCommands:\033[0m")
-	fmt.Println("  \033[38;5;117madd\033[0m     Add files to tracking")
-	fmt.Println("  \033[38;5;117mdel\033[0m     Delete tracked files")
-	fmt.Println("  \033[38;5;117mcheck\033[0m   Check status of tracked files")
-	fmt.Println("  \033[38;5;117mclean\033[0m   Clean up tracked files")
+
+	fmt.Printf("%sCOMMANDS:%s\n", colorCyan, colorReset)
+	fmt.Printf("  %sadd%s       Add files to tracking\n", colorGreen, colorReset)
+	fmt.Printf("  %sdel%s       Remove files from tracking\n", colorRed, colorReset)
+	fmt.Printf("  %scheck%s     Verify file integrity\n", colorBlue, colorReset)
+	fmt.Printf("  %sclean%s     Remove missing file entries\n", colorYellow, colorReset)
+	fmt.Printf("  %supdate%s    Update old .ghost files with metadata\n", colorMagenta, colorReset)
 	fmt.Println()
-	fmt.Println("\033[38;5;116mOptions:\033[0m")
-	fmt.Println("  \033[38;5;148m-c\033[0m          Load .ghostconf from target directory")
-	fmt.Println("  \033[38;5;148m-cs\033[0m         Load .ghostconf from target directory (strict mode)")
-	fmt.Println("  \033[38;5;148m-cf FILE\033[0m    Load config from specified file")
-	fmt.Println("  \033[38;5;148m-csf FILE\033[0m   Load config from specified file (strict mode)")
-	fmt.Println("  \033[38;5;148m-r\033[0m          Process directories recursively")
-	fmt.Println("  \033[38;5;148m-q\033[0m          Quiet mode (for scripting)")
-	fmt.Println("  \033[38;5;148m-p N\033[0m        Number of parallel threads")
-	fmt.Println("  \033[38;5;148m-f\033[0m          Force overwrite without prompt")
+
+	fmt.Printf("%sOPTIONS:%s\n", colorCyan, colorReset)
+	fmt.Println("  -c              Load .ghostconf from target directory")
+	fmt.Println("  -cs             Load .ghostconf (strict mode)")
+	fmt.Println("  -cf FILE        Load config from specified file")
+	fmt.Println("  -csf FILE       Load config from file (strict mode)")
+	fmt.Println("  -r              Process directories recursively")
+	fmt.Println("  -q              Quiet mode (minimal output)")
+	fmt.Println("  -p N            Number of parallel workers")
+	fmt.Println("  -f              Force operations without prompts")
+	fmt.Println("  -fc             Force hash calculation (ignore cache)")
 	fmt.Println()
-	fmt.Println("\033[38;5;116mConfig modes:\033[0m")
-	fmt.Println("  Normal: Allows subdirectory .ghostconf files to override ignore rules")
-	fmt.Println("  Strict: Uses only the root config ignore rules for all subdirectories")
-	fmt.Println()
-	fmt.Println("\033[38;5;116mExit codes:\033[0m")
-	fmt.Println("  0       Success")
-	fmt.Println("  1       Corruption found")
-	fmt.Println("  2       Error occurred")
-	fmt.Println()
-	fmt.Println("\033[38;5;116mExamples:\033[0m")
-	fmt.Println("  dataGhost \033[38;5;117madd\033[0m file.txt")
-	fmt.Println("  dataGhost \033[38;5;148m-r\033[0m \033[38;5;117mclean\033[0m")
-	fmt.Println("  dataGhost \033[38;5;148m-q\033[0m \033[38;5;117mcheck\033[0m .")
-	fmt.Println("  dataGhost \033[38;5;148m-c\033[0m \033[38;5;117madd\033[0m . (loads .ghostconf from target dir)")
-	fmt.Println("  dataGhost \033[38;5;148m-cf config.yaml\033[0m \033[38;5;117madd\033[0m .")
-	fmt.Println("  dataGhost \033[38;5;148m-cs\033[0m \033[38;5;117madd\033[0m . (strict mode with .ghostconf)")
-	fmt.Println("  dataGhost \033[38;5;148m-csf config.yaml\033[0m \033[38;5;117madd\033[0m . (strict mode with custom config)")
-	fmt.Println()
-	fmt.Println("\033[38;5;116mConfig file example (.ghostconf):\033[0m")
+
+	fmt.Printf("%sCONFIG FILE EXAMPLE (.ghostconf):%s\n", colorCyan, colorReset)
 	fmt.Println("  ignore:")
 	fmt.Println("    - \"*.tmp\"")
 	fmt.Println("    - \"*.log\"")
@@ -637,23 +952,42 @@ func help() {
 	fmt.Println("    - \".git/\"")
 	fmt.Println("  buffer: 262144")
 	fmt.Println("  parallel: 4")
-	fmt.Println("  quiet: false")
+	fmt.Println("  show_progress: true")
+	fmt.Println()
+
+	fmt.Printf("%sEXAMPLES:%s\n", colorCyan, colorReset)
+	fmt.Println("  dataGhost add file.txt")
+	fmt.Println("  dataGhost -r check .")
+	fmt.Println("  dataGhost -c -r add /path/to/dir")
+	fmt.Println("  dataGhost -q check . && echo \"All files OK\"")
+	fmt.Println("  dataGhost -fc check .")
+	fmt.Println("  dataGhost update .ghost")
+	fmt.Println("  dataGhost -r update .")
+	fmt.Println()
+
+	fmt.Printf("%sEXIT CODES:%s\n", colorCyan, colorReset)
+	fmt.Println("  0  Success")
+	fmt.Println("  1  Corruption detected")
+	fmt.Println("  2  Error occurred")
 }
 
 func main() {
+	startTime = time.Now()
+
 	var useConfig bool
 	var useStrictConfig bool
 	var configFile string
 	var strictConfigFile string
 
 	flag.BoolVar(&useConfig, "c", false, "Load .ghostconf from target directory")
-	flag.BoolVar(&useStrictConfig, "cs", false, "Load .ghostconf from target directory (strict mode)")
-	flag.StringVar(&configFile, "cf", "", "Load config from specified file")
-	flag.StringVar(&strictConfigFile, "csf", "", "Load config from specified file (strict mode)")
-	flag.IntVar(&parallelism, "p", 1, "Number of parallel threads")
-	flag.BoolVar(&quietMode, "q", false, "Quiet mode (for scripting)")
-	recursive := flag.Bool("r", false, "Process directories recursively")
-	forceOverwrite := flag.Bool("f", false, "Force overwrite without prompt")
+	flag.BoolVar(&useStrictConfig, "cs", false, "Load .ghostconf (strict mode)")
+	flag.StringVar(&configFile, "cf", "", "Load config from file")
+	flag.StringVar(&strictConfigFile, "csf", "", "Load config from file (strict mode)")
+	flag.IntVar(&parallelism, "p", 1, "Number of parallel workers")
+	flag.BoolVar(&quietMode, "q", false, "Quiet mode")
+	recursive := flag.Bool("r", false, "Process recursively")
+	forceOverwrite := flag.Bool("f", false, "Force operations")
+	flag.BoolVar(&forceCheck, "fc", false, "Force hash calculation (ignore cache)")
 	flag.Parse()
 
 	if flag.NArg() < 2 {
@@ -682,10 +1016,11 @@ func main() {
 	}
 
 	if err := loadConfig(finalConfigFile, path, useAnyConfig, useAnyConfig); err != nil {
-		fmt.Printf("\033[38;5;204mError loading config: %v\033[0m\n", err)
+		fmt.Printf("%s[FATAL]%s Failed to load config: %v\n", colorRed, colorReset, err)
 		os.Exit(2)
 	}
 
+	// Apply CLI overrides
 	if flag.Lookup("p").Value.String() != "1" {
 		rootConfig.Parallel = parallelism
 	} else {
@@ -709,6 +1044,8 @@ func main() {
 		*forceOverwrite = rootConfig.Force
 	}
 
+	showProgress = rootConfig.ShowProgress && !quietMode
+
 	var err error
 	switch command {
 	case "add":
@@ -723,17 +1060,26 @@ func main() {
 		}
 	case "clean":
 		err = clean(path, *recursive)
+	case "update":
+		err = update(path, *recursive)
+		printSummary()
+		if globalStats.corrupted > 0 {
+			os.Exit(1)
+		}
 	default:
-		fmt.Printf("\033[38;5;204mError: Unknown command: %s\033[0m\n", command)
+		fmt.Printf("%s[ERROR]%s Unknown command: %s\n", colorRed, colorReset, command)
 		help()
 		os.Exit(2)
 	}
 
 	if err != nil {
-		fmt.Printf("\033[38;5;204mError: %v\033[0m\n", err)
+		fmt.Printf("%s[FATAL]%s %v\n", colorRed, colorReset, err)
 		os.Exit(2)
+	}
+
+	if !quietMode && command != "check" && command != "update" {
+		printSummary()
 	}
 
 	os.Exit(0)
 }
-
