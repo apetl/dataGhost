@@ -75,11 +75,12 @@ const (
 )
 
 const (
-	minBuffer       = 64 * 1024        // 64 KB
-	defaultBuffer   = 256 * 1024       // 256 KB
-	maxBuffer       = 1024 * 1024      // 1 MB
-	mmapThreshold   = 10 * 1024 * 1024 // use mmap for files > 10MB
-	workerQueueSize = 1000
+	minBuffer          = 64 * 1024        // 64 KB
+	defaultBuffer      = 256 * 1024       // 256 KB
+	maxBuffer          = 1024 * 1024      // 1 MB
+	mmapThreshold      = 10 * 1024 * 1024 // use mmap for files > 10MB
+	workerQueueSize    = 1000
+	progressUpdateFreq = 10 // update progress every N items
 )
 
 var (
@@ -101,7 +102,10 @@ var (
 	}
 	hashPool = sync.Pool{
 		New: func() interface{} {
-			h, _ := blake2b.New256(nil)
+			h, err := blake2b.New256(nil)
+			if err != nil {
+				panic(fmt.Sprintf("failed to create blake2b hasher: %v", err))
+			}
 			return h
 		},
 	}
@@ -230,12 +234,11 @@ func getConfigForPath(dirPath string) conf {
 	config := rootConfig
 	localConfigPath := filepath.Join(dirPath, ".ghostconf")
 	if localConfig, err := loadConfigFromFile(localConfigPath); err == nil {
-		// only local `ignore` patterns are inherited for non-strict mode.
 		config.Ignore = localConfig.Ignore
 	}
 
-	configCache.Store(dirPath, config)
-	return config
+	actual, _ := configCache.LoadOrStore(dirPath, config)
+	return actual.(conf)
 }
 
 // isIgnored checks if a file or directory should be ignored based on ignore patterns.
@@ -416,11 +419,7 @@ func writeGhost(data map[string]fileData, ghostPath string) error {
 }
 
 // needsRehash checks if a file needs rehashing based on modification time and size.
-func needsRehash(filePath string, stored fileData) bool {
-	stat, err := os.Stat(filePath)
-	if err != nil {
-		return true
-	}
+func needsRehash(stat os.FileInfo, stored fileData) bool {
 	return stat.Size() != stored.Size || !stat.ModTime().Equal(stored.Modified)
 }
 
@@ -447,7 +446,7 @@ func runWorkers[T any](jobs []T, workerFunc func(T), numWorkers int, operationNa
 			for job := range jobChan {
 				workerFunc(job)
 				current := processed.Add(1)
-				if current%10 == 0 {
+				if current%progressUpdateFreq == 0 {
 					printProgress(current, totalJobs, operationName)
 				}
 			}
@@ -487,10 +486,10 @@ func addF(filePath, ghostPath, basePath string) {
 
 	mutex := getGhostMutex(ghostPath)
 	mutex.Lock()
-	defer mutex.Unlock()
 
 	data, err := readGhost(ghostPath)
 	if err != nil {
+		mutex.Unlock()
 		logf("%s[ERROR]%s %v\n", colorRed, colorReset, err)
 		globalStats.errors.Add(1)
 		return
@@ -500,6 +499,7 @@ func addF(filePath, ghostPath, basePath string) {
 	storedData, exists := data[filename]
 	if exists {
 		if currentHash == storedData.Blake2b {
+			mutex.Unlock()
 			logf("%s[UNCHANGED]%s %s\n", colorGray, colorReset, filename)
 			return
 		}
@@ -515,11 +515,11 @@ func addF(filePath, ghostPath, basePath string) {
 			var response string
 			fmt.Scanln(&response)
 			outputMutex.Unlock()
-			mutex.Lock()
 			if response != "y" && response != "Y" {
 				logf("%s[CANCELLED]%s Operation cancelled by user for %s.\n", colorYellow, colorReset, filename)
 				return
 			}
+			mutex.Lock()
 		}
 		globalStats.modified.Add(1)
 		logf("%s[UPDATED]%s %s\n", colorBlue, colorReset, filename)
@@ -535,9 +535,12 @@ func addF(filePath, ghostPath, basePath string) {
 	}
 
 	if err := writeGhost(data, ghostPath); err != nil {
+		mutex.Unlock()
 		logf("%s[ERROR]%s %v\n", colorRed, colorReset, err)
 		globalStats.errors.Add(1)
+		return
 	}
+	mutex.Unlock()
 }
 
 // delF removes a file from the ghost database.
@@ -595,7 +598,15 @@ func checkF(filePath, ghostPath, basePath string) {
 	}
 
 	globalStats.checked.Add(1)
-	if !forceCheck && !needsRehash(filePath, storedData) {
+
+	stat, err := os.Stat(filePath)
+	if err != nil {
+		globalStats.errors.Add(1)
+		logf("%s[ERROR]%s Failed to stat file '%s': %v\n", colorRed, colorReset, filePath, err)
+		return
+	}
+
+	if !forceCheck && !needsRehash(stat, storedData) {
 		globalStats.ok.Add(1)
 		logf("%s[OK]%s %s %s(cached)%s\n", colorGreen, colorReset, filename, colorGray, colorReset)
 		return
@@ -872,9 +883,10 @@ func printSummary() {
 	fmt.Println()
 
 	const innerWidth = 43
-	topBorder := fmt.Sprintf("%s╔%s╗%s", colorBlue, strings.Repeat("═", innerWidth), colorReset)
-	midBorder := fmt.Sprintf("%s╠%s╣%s", colorBlue, strings.Repeat("═", innerWidth), colorReset)
-	botBorder := fmt.Sprintf("%s╚%s╝%s", colorBlue, strings.Repeat("═", innerWidth), colorReset)
+
+	topBorder := colorBlue + "╔" + strings.Repeat("═", innerWidth) + "╗" + colorReset
+	midBorder := colorBlue + "╠" + strings.Repeat("═", innerWidth) + "╣" + colorReset
+	botBorder := colorBlue + "╚" + strings.Repeat("═", innerWidth) + "╝" + colorReset
 	border := colorBlue + "║" + colorReset
 
 	fmt.Println(topBorder)
@@ -885,18 +897,17 @@ func printSummary() {
 	fmt.Println(midBorder)
 
 	printDataLine := func(label, value, valueColor string) {
-		coloredValue := value
-		if valueColor != "" {
-			coloredValue = valueColor + value + colorReset
-		}
-
-		paddingSize := innerWidth - (len(label) + 2) - len(value)
+		visibleLen := len(value)
+		paddingSize := innerWidth - len(label) - visibleLen - 2
 		if paddingSize < 0 {
 			paddingSize = 0
 		}
-		padding := strings.Repeat(" ", paddingSize)
 
-		fmt.Printf("%s %s%s%s %s\n", border, label, padding, coloredValue, border)
+		if valueColor != "" {
+			value = valueColor + value + colorReset
+		}
+
+		fmt.Printf("%s %s%*s%s %s\n", border, label, paddingSize, "", value, border)
 	}
 
 	if val := globalStats.checked.Load(); val > 0 {
@@ -1038,7 +1049,14 @@ func main() {
 
 	// cli overrides
 	if isFlagSet("p") {
+		if parallelism < 1 {
+			fmt.Printf("%s[FATAL]%s Parallelism must be at least 1, got %d\n", colorRed, colorReset, parallelism)
+			os.Exit(2)
+		}
 		rootConfig.Parallel = parallelism
+	}
+	if rootConfig.Parallel < 1 {
+		rootConfig.Parallel = 1
 	}
 	if isFlagSet("q") {
 		rootConfig.Quiet = quietMode
