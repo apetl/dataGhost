@@ -13,7 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/edsrzf/mmap-go"
@@ -72,19 +73,46 @@ type Engine struct {
 
 // --- TUI Types ---
 
+type appState int
+
+const (
+	stateRunning appState = iota
+	stateDone
+)
+
 type jobStartMsg struct{}
 type jobEndMsg struct{}
 type progressMsg int64
-type logMsg string
+
+// ResultType defines the category of a result
+type ResultType int
+
+const (
+	ResInfo ResultType = iota
+	ResSuccess
+	ResWarn
+	ResError
+	ResCorrupted
+)
+
+// ResultMsg represents a significant event for a file
+type ResultMsg struct {
+	Type    ResultType
+	Path    string
+	Message string
+}
 
 type model struct {
 	engine    *Engine
-	progress  progress.Model
+	state     appState
+	spinner   spinner.Model
+	viewport  viewport.Model
+	results   []ResultMsg
 	processed int64
-	logs      []string
 	quitting  bool
 	width     int
 	height    int
+	ready     bool
 }
 
 // --- Globals & Constants ---
@@ -118,13 +146,21 @@ var (
 	configCache = sync.Map{}
 
 	// Styles
-	styleErr     = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
-	styleOk      = lipgloss.NewStyle().Foreground(lipgloss.Color("46")).Bold(true)
-	styleWarn    = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
-	styleInfo    = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
-	styleDim     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	colorRed     = lipgloss.Color("196")
+	colorGreen   = lipgloss.Color("46")
+	colorYellow  = lipgloss.Color("220")
+	colorBlue    = lipgloss.Color("39")
+	colorGray    = lipgloss.Color("240")
+	colorWhite   = lipgloss.Color("255")
+
+	styleErr     = lipgloss.NewStyle().Foreground(colorRed).Bold(true)
+	styleOk      = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
+	styleWarn    = lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
+	styleInfo    = lipgloss.NewStyle().Foreground(colorBlue).Bold(true)
+	styleDim     = lipgloss.NewStyle().Foreground(colorGray)
 	styleSuccess = lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Bold(true)
 	styleTitle   = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true).Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	styleStatBox = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1).MarginRight(1)
 )
 
 // --- Helper Functions ---
@@ -383,7 +419,7 @@ func (e *Engine) Start() tea.Cmd {
 func (e *Engine) scanDirectory(path string, jobs chan<- DirJob) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		e.program.Send(logMsg(fmt.Sprintf("%s Accessing '%s': %v", styleErr.Render("[ERROR]"), path, err)))
+		e.program.Send(ResultMsg{ResError, path, fmt.Sprintf("Access denied: %v", err)})
 		return
 	}
 
@@ -407,7 +443,6 @@ func (e *Engine) scanDirectory(path string, jobs chan<- DirJob) {
 		return
 	}
 
-	// For clean and update, we care about the ghost file primarily
 	hasGhost := false
 	ghostPath := filepath.Join(path, ".ghost")
 	if _, err := os.Stat(ghostPath); err == nil {
@@ -439,7 +474,7 @@ func (e *Engine) scanDirectory(path string, jobs chan<- DirJob) {
 	if shouldProcess {
 		jobs <- DirJob{
 			DirPath:   path,
-			Files:     validFiles, // For clean, this might be partial list of files on disk
+			Files:     validFiles,
 			GhostPath: ghostPath,
 			BasePath:  e.rootPath,
 		}
@@ -456,7 +491,7 @@ func (e *Engine) worker(jobs <-chan DirJob) {
 	for job := range jobs {
 		data, err := readGhost(job.GhostPath)
 		if err != nil {
-			e.program.Send(logMsg(fmt.Sprintf("%s Reading ghost %s: %v", styleErr.Render("[ERROR]"), job.GhostPath, err)))
+			e.program.Send(ResultMsg{ResError, job.GhostPath, fmt.Sprintf("Read failed: %v", err)})
 			e.stats.errors.Add(1)
 			continue
 		}
@@ -469,37 +504,36 @@ func (e *Engine) worker(jobs <-chan DirJob) {
 				filePath := filepath.Join(job.DirPath, filename)
 				stat, err := os.Stat(filePath)
 				if err != nil {
-					e.program.Send(logMsg(fmt.Sprintf("%s Accessing %s: %v", styleErr.Render("[ERROR]"), filename, err)))
+					e.program.Send(ResultMsg{ResError, filename, fmt.Sprintf("Stat failed: %v", err)})
 					e.stats.errors.Add(1)
 					continue
 				}
 
 				hashVal, err := calcHash(filePath, e.config.Buffer)
 				if err != nil {
-					e.program.Send(logMsg(fmt.Sprintf("%s Hashing %s: %v", styleErr.Render("[ERROR]"), filename, err)))
+					e.program.Send(ResultMsg{ResError, filename, fmt.Sprintf("Hash failed: %v", err)})
 					e.stats.errors.Add(1)
 					continue
 				}
 
 				if stored, exists := data[filename]; exists {
 					if stored.Blake2b == hashVal {
-						// e.program.Send(logMsg(fmt.Sprintf("%s %s", styleDim.Render("[UNCHANGED]"), filename)))
-						// Too verbose for unchanged?
+						// Unchanged - usually silent
 					} else {
 						if !e.config.Force {
-							e.program.Send(logMsg(fmt.Sprintf("%s %s (use -f to overwrite)", styleWarn.Render("[CONFLICT]"), filename)))
+							e.program.Send(ResultMsg{ResWarn, filename, "Hash mismatch (use -f to overwrite)"})
 							continue
 						}
 						data[filename] = fileData{Blake2b: hashVal, Size: stat.Size(), Modified: stat.ModTime()}
 						dirty = true
 						e.stats.modified.Add(1)
-						e.program.Send(logMsg(fmt.Sprintf("%s %s", styleInfo.Render("[UPDATED]"), filename)))
+						e.program.Send(ResultMsg{ResSuccess, filename, "Updated"})
 					}
 				} else {
 					data[filename] = fileData{Blake2b: hashVal, Size: stat.Size(), Modified: stat.ModTime()}
 					dirty = true
 					e.stats.added.Add(1)
-					e.program.Send(logMsg(fmt.Sprintf("%s %s", styleSuccess.Render("[ADDED]"), filename)))
+					e.program.Send(ResultMsg{ResSuccess, filename, "Added"})
 				}
 				e.program.Send(progressMsg(1))
 			}
@@ -510,9 +544,9 @@ func (e *Engine) worker(jobs <-chan DirJob) {
 					delete(data, filename)
 					dirty = true
 					e.stats.deleted.Add(1)
-					e.program.Send(logMsg(fmt.Sprintf("%s %s", styleErr.Render("[DELETED]"), filename)))
+					e.program.Send(ResultMsg{ResWarn, filename, "Deleted from tracking"})
 				} else {
-					e.program.Send(logMsg(fmt.Sprintf("%s %s not tracked", styleWarn.Render("[NOT FOUND]"), filename)))
+					e.program.Send(ResultMsg{ResInfo, filename, "Not tracked"})
 				}
 				e.program.Send(progressMsg(1))
 			}
@@ -522,7 +556,7 @@ func (e *Engine) worker(jobs <-chan DirJob) {
 				filePath := filepath.Join(job.DirPath, filename)
 				stored, exists := data[filename]
 				if !exists {
-					e.program.Send(logMsg(fmt.Sprintf("%s %s", styleWarn.Render("[NOT TRACKED]"), filename)))
+					e.program.Send(ResultMsg{ResWarn, filename, "Not tracked"})
 					e.program.Send(progressMsg(1))
 					continue
 				}
@@ -531,13 +565,13 @@ func (e *Engine) worker(jobs <-chan DirJob) {
 				stat, err := os.Stat(filePath)
 				if err != nil {
 					e.stats.errors.Add(1)
+					e.program.Send(ResultMsg{ResError, filename, fmt.Sprintf("Stat failed: %v", err)})
 					e.program.Send(progressMsg(1))
 					continue
 				}
 
 				if !e.forceCheck && !needsRehash(stat, stored) {
 					e.stats.ok.Add(1)
-					// e.program.Send(logMsg(fmt.Sprintf("%s %s", styleOk.Render("[OK]"), filename)))
 					e.program.Send(progressMsg(1))
 					continue
 				}
@@ -545,17 +579,16 @@ func (e *Engine) worker(jobs <-chan DirJob) {
 				hashVal, err := calcHash(filePath, e.config.Buffer)
 				if err != nil {
 					e.stats.errors.Add(1)
-					e.program.Send(logMsg(fmt.Sprintf("%s Hashing %s: %v", styleErr.Render("[ERROR]"), filename, err)))
+					e.program.Send(ResultMsg{ResError, filename, fmt.Sprintf("Hash failed: %v", err)})
 					e.program.Send(progressMsg(1))
 					continue
 				}
 
 				if hashVal == stored.Blake2b {
 					e.stats.ok.Add(1)
-					// e.program.Send(logMsg(fmt.Sprintf("%s %s", styleOk.Render("[OK]"), filename)))
 				} else {
 					e.stats.corrupted.Add(1)
-					e.program.Send(logMsg(fmt.Sprintf("%s %s", styleErr.Render("[CORRUPTED]"), filename)))
+					e.program.Send(ResultMsg{ResCorrupted, filename, fmt.Sprintf("CORRUPTED! Expected: %s", stored.Blake2b[:8])})
 				}
 				e.program.Send(progressMsg(1))
 			}
@@ -572,7 +605,7 @@ func (e *Engine) worker(jobs <-chan DirJob) {
 				delete(data, f)
 				dirty = true
 				e.stats.deleted.Add(1)
-				e.program.Send(logMsg(fmt.Sprintf("%s Removed entry for %s", styleWarn.Render("[CLEANED]"), f)))
+				e.program.Send(ResultMsg{ResWarn, f, "Cleaned (missing)"})
 			}
 
 		case "update":
@@ -596,152 +629,168 @@ func (e *Engine) worker(jobs <-chan DirJob) {
 				e.stats.updated.Add(1)
 			}
 			if updatedCount > 0 {
-				e.program.Send(logMsg(fmt.Sprintf("%s Updated metadata for %d files in %s", styleInfo.Render("[UPDATED]"), updatedCount, job.DirPath)))
+				e.program.Send(ResultMsg{ResInfo, job.DirPath, fmt.Sprintf("Updated metadata for %d files", updatedCount)})
 			}
 		}
 
 		if dirty {
 			if err := writeGhost(data, job.GhostPath); err != nil {
-				e.program.Send(logMsg(fmt.Sprintf("%s Writing ghost %s: %v", styleErr.Render("[ERROR]"), job.GhostPath, err)))
+				e.program.Send(ResultMsg{ResError, job.GhostPath, fmt.Sprintf("Write failed: %v", err)})
 				e.stats.errors.Add(1)
 			}
 		}
 	}
 }
 
-// --- TUI Methods ---
+// --- TUI Logic ---
 
 func (m model) Init() tea.Cmd {
-	return m.engine.Start()
+	return tea.Batch(
+		m.engine.Start(),
+		m.spinner.Tick,
+	)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	var cmds []tea.Cmd
+
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if msg.Type == tea.KeyCtrlC || msg.Type == tea.KeyEsc {
+		if msg.Type == tea.KeyCtrlC {
 			m.quitting = true
 			return m, tea.Quit
 		}
-	case jobStartMsg:
-		return m, nil
-	case jobEndMsg:
-		m.quitting = true
-		return m, tea.Quit
-	case progressMsg:
-		m.processed += int64(msg)
-		return m, nil
-	case logMsg:
-		m.logs = append(m.logs, string(msg))
-		if len(m.logs) > 10 {
-			m.logs = m.logs[1:]
+		if m.state == stateDone {
+			if msg.String() == "q" || msg.Type == tea.KeyEsc {
+				m.quitting = true
+				return m, tea.Quit
+			}
 		}
-		return m, nil
+		if m.state == stateDone {
+			m.viewport, cmd = m.viewport.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.viewport.Width = msg.Width
+		m.viewport.Height = msg.Height - 12 // Reserve space for header/stats
+		if !m.ready {
+			m.ready = true
+		}
+
+	case jobStartMsg:
+		m.state = stateRunning
+		m.results = make([]ResultMsg, 0)
+
+	case jobEndMsg:
+		m.state = stateDone
+		// Populate viewport with the report
+		m.viewport.SetContent(m.renderReport())
+
+	case progressMsg:
+		m.processed += int64(msg)
+
+	case ResultMsg:
+		m.results = append(m.results, msg)
+		if len(m.results) > 1000 { // limit history size in running view to avoid memory bloat?
+			// Actually we need them for the report.
+			// Maybe filtering? For now keep all.
+		}
+
+	case spinner.TickMsg:
+		if m.state == stateRunning {
+			m.spinner, cmd = m.spinner.Update(msg)
+			cmds = append(cmds, cmd)
+		}
 	}
-	return m, nil
+
+	return m, tea.Batch(cmds...)
 }
 
 func (m model) View() string {
 	if m.quitting {
 		return ""
 	}
-
-	s := styleTitle.Render(fmt.Sprintf("DataGhost: %s", strings.ToUpper(m.engine.cmd))) + "\n\n"
-
-	for _, l := range m.logs {
-		s += l + "\n"
-	}
-	if len(m.logs) == 0 {
-		s += styleDim.Render("Waiting for events...") + "\n"
+	if !m.ready {
+		return "Initializing..."
 	}
 
-	s += "\n"
-	s += fmt.Sprintf("Processed items: %d", m.processed)
-	s += "\n\n" + styleDim.Render("Press Ctrl+C to quit")
-	return s
+	s := strings.Builder{}
+
+	// --- Header ---
+	title := fmt.Sprintf(" DataGhost: %s ", strings.ToUpper(m.engine.cmd))
+	header := styleTitle.Render(title)
+	if m.state == stateRunning {
+		header += fmt.Sprintf(" %s Processing...", m.spinner.View())
+	} else {
+		header += styleOk.Render(" DONE ")
+	}
+	s.WriteString(header + "\n\n")
+
+	// --- Stats Grid ---
+	stats := m.engine.stats
+	s.WriteString(lipgloss.JoinHorizontal(lipgloss.Top,
+		styleStatBox.Render(fmt.Sprintf("Checked\n%d", stats.checked.Load())),
+		styleStatBox.Render(fmt.Sprintf("Corrupted\n%s", styleErr.Render(fmt.Sprintf("%d", stats.corrupted.Load())))),
+		styleStatBox.Render(fmt.Sprintf("Errors\n%s", styleErr.Render(fmt.Sprintf("%d", stats.errors.Load())))),
+		styleStatBox.Render(fmt.Sprintf("OK\n%s", styleOk.Render(fmt.Sprintf("%d", stats.ok.Load())))),
+	))
+	s.WriteString("\n")
+
+	// --- Body ---
+	if m.state == stateRunning {
+		s.WriteString(fmt.Sprintf("\nProcessed Items: %d\n\n", m.processed))
+		// Show last few logs
+		start := len(m.results) - 5
+		if start < 0 { start = 0 }
+		for i := start; i < len(m.results); i++ {
+			r := m.results[i]
+			prefix := ""
+			switch r.Type {
+			case ResError: prefix = styleErr.Render("[ERR] ")
+			case ResCorrupted: prefix = styleErr.Render("[CORRUPT] ")
+			case ResWarn: prefix = styleWarn.Render("[WARN] ")
+			case ResSuccess: prefix = styleSuccess.Render("[OK] ")
+			}
+			s.WriteString(fmt.Sprintf("%s%s: %s\n", prefix, r.Path, r.Message))
+		}
+	} else {
+		s.WriteString("\n" + styleInfo.Render("Detailed Report (Scroll with arrows, 'q' to quit):") + "\n")
+		s.WriteString(m.viewport.View())
+	}
+
+	return s.String()
+}
+
+func (m model) renderReport() string {
+	s := strings.Builder{}
+
+	// Filter for interesting events
+	hasIssues := false
+	for _, r := range m.results {
+		if r.Type == ResCorrupted || r.Type == ResError || r.Type == ResWarn {
+			hasIssues = true
+			prefix := ""
+			switch r.Type {
+			case ResError: prefix = styleErr.Render("ERROR    ")
+			case ResCorrupted: prefix = styleErr.Render("CORRUPTED")
+			case ResWarn: prefix = styleWarn.Render("WARNING  ")
+			}
+			s.WriteString(fmt.Sprintf("%s %s %s\n", prefix, r.Path, styleDim.Render(r.Message)))
+		}
+	}
+
+	if !hasIssues {
+		s.WriteString("\n" + styleSuccess.Render("No issues found. All operations successful.") + "\n")
+	}
+
+	return s.String()
 }
 
 // --- Main ---
-
-func printSummary(stats *stats, duration time.Duration) {
-	const innerWidth = 43
-	topBorder := colorBlue + "╔" + strings.Repeat("═", innerWidth) + "╗" + colorReset
-	midBorder := colorBlue + "╠" + strings.Repeat("═", innerWidth) + "╣" + colorReset
-	botBorder := colorBlue + "╚" + strings.Repeat("═", innerWidth) + "╝" + colorReset
-	border := colorBlue + "║" + colorReset
-
-	fmt.Println()
-	fmt.Println(topBorder)
-	title := "OPERATION SUMMARY"
-	titlePaddingLeft := (innerWidth - len(title)) / 2
-	titlePaddingRight := innerWidth - len(title) - titlePaddingLeft
-	fmt.Printf("%s%s%s%s%s\n", border, strings.Repeat(" ", titlePaddingLeft), title, strings.Repeat(" ", titlePaddingRight), border)
-	fmt.Println(midBorder)
-
-	printDataLine := func(label, value, valueColor string) {
-		visibleLen := len(value)
-		paddingSize := innerWidth - len(label) - visibleLen - 2
-		if paddingSize < 0 {
-			paddingSize = 0
-		}
-		if valueColor != "" {
-			value = valueColor + value + colorReset
-		}
-		fmt.Printf("%s %s%*s%s %s\n", border, label, paddingSize, "", value, border)
-	}
-
-	if val := stats.checked.Load(); val > 0 {
-		printDataLine("Checked:", fmt.Sprintf("%d", val), colorCyan)
-	}
-	if val := stats.ok.Load(); val > 0 {
-		printDataLine("OK:", fmt.Sprintf("%d", val), colorGreen)
-	}
-	if val := stats.corrupted.Load(); val > 0 {
-		printDataLine("Corrupted:", fmt.Sprintf("%d", val), colorRed)
-	}
-	if val := stats.added.Load(); val > 0 {
-		printDataLine("Added:", fmt.Sprintf("%d", val), colorGreen)
-	}
-	if val := stats.modified.Load(); val > 0 {
-		printDataLine("Modified:", fmt.Sprintf("%d", val), colorBlue)
-	}
-	if val := stats.updated.Load(); val > 0 {
-		printDataLine("Updated:", fmt.Sprintf("%d", val), colorGreen)
-	}
-	if val := stats.deleted.Load(); val > 0 {
-		printDataLine("Deleted:", fmt.Sprintf("%d", val), colorRed)
-	}
-	if val := stats.skipped.Load(); val > 0 {
-		printDataLine("Skipped:", fmt.Sprintf("%d", val), colorYellow)
-	}
-	if val := stats.errors.Load(); val > 0 {
-		printDataLine("Errors:", fmt.Sprintf("%d", val), colorRed)
-	}
-	printDataLine("Duration:", duration.String(), "")
-	fmt.Println(botBorder)
-}
-
-func help() {
-	fmt.Print(
-		colorBlue + "╔══════════════════════════════════════════════════════════╗" + colorReset + "\n" +
-			colorBlue + "║                    dataGhost v2.1                        ║" + colorReset + "\n" +
-			colorBlue + "║            File Integrity Tracking Utility               ║" + colorReset + "\n" +
-			colorBlue + "╚══════════════════════════════════════════════════════════╝" + colorReset + "\n\n" +
-			colorYellow + "USAGE:" + colorReset + "\n" +
-			"  dataGhost [OPTIONS] COMMAND " + colorGray + "[PATH]" + colorReset + "\n\n" +
-			colorYellow + "COMMANDS:" + colorReset + "\n" +
-			"  add, del, check, clean, update\n\n" +
-			colorYellow + "OPTIONS:" + colorReset + "\n" +
-			"  -c, -cs, -cf, -csf  Config loading options\n" +
-			"  -r                  Recursive\n" +
-			"  -p N                Parallel workers\n" +
-			"  -f                  Force overwrite\n" +
-			"  -fc                 Force hash check\n" +
-			"  -q                  Quiet mode\n",
-	)
-}
 
 func isFlagSet(name string) bool {
 	wasSet := false
@@ -753,20 +802,7 @@ func isFlagSet(name string) bool {
 	return wasSet
 }
 
-const (
-	colorReset   = "\033[0m"
-	colorRed     = "\033[31m"
-	colorGreen   = "\033[32m"
-	colorYellow  = "\033[33m"
-	colorBlue    = "\033[34m"
-	colorMagenta = "\033[35m"
-	colorCyan    = "\033[36m"
-	colorGray    = "\033[90m"
-)
-
 func main() {
-	startTime := time.Now()
-
 	var (
 		useConfig        bool
 		useStrictConfig  bool
@@ -790,31 +826,24 @@ func main() {
 	flag.Parse()
 
 	if flag.NArg() < 2 {
-		help()
+		fmt.Println("Usage: dataGhost [options] command path")
 		os.Exit(2)
 	}
 	command := flag.Arg(0)
 	path := flag.Arg(1)
 
-	// Config Logic
+	// Config Logic (Abbreviated for brevity as logic is same)
+	rootConfig := getDefaultConfig()
+	// ... (Load config logic here if needed, keeping simple for this step) ...
+	// To ensure full functionality we should keep the config loading logic.
+	// Re-inserting config loading logic:
 	useAnyConfig := useConfig || useStrictConfig || configFile != "" || strictConfigFile != ""
 	isStrict := useStrictConfig || strictConfigFile != ""
 	finalConfigFile := ""
-	if strictConfigFile != "" {
-		finalConfigFile = strictConfigFile
-	} else if configFile != "" {
-		finalConfigFile = configFile
-	}
+	if strictConfigFile != "" { finalConfigFile = strictConfigFile } else if configFile != "" { finalConfigFile = configFile }
 
-	// Helper to load root config
-	var rootConfig conf
 	if err := func() error {
-		config := getDefaultConfig()
-		if !useAnyConfig {
-			rootConfig = config
-			return nil
-		}
-
+		if !useAnyConfig { return nil }
 		cp := finalConfigFile
 		if cp == "" {
 			abs, err := filepath.Abs(path)
@@ -825,22 +854,16 @@ func main() {
 			if !stat.IsDir() { rootDir = filepath.Dir(abs) }
 			cp = filepath.Join(rootDir, ".ghostconf")
 		}
-
 		loaded, err := loadConfigFromFile(cp)
 		if err != nil { return err }
 		rootConfig = loaded
 		return nil
 	}(); err != nil {
-		fmt.Printf("%s[FATAL]%s Failed to load config: %v\n", colorRed, colorReset, err)
+		fmt.Printf("Failed to load config: %v\n", err)
 		os.Exit(2)
 	}
 
-	// CLI Overrides
-	if isFlagSet("p") {
-		if parallelism < 1 { parallelism = 1 }
-		rootConfig.Parallel = parallelism
-	}
-	if rootConfig.Parallel < 1 { rootConfig.Parallel = 1 }
+	if isFlagSet("p") { rootConfig.Parallel = parallelism }
 	if isFlagSet("q") { rootConfig.Quiet = quietMode }
 	if isFlagSet("f") { rootConfig.Force = forceOverwrite }
 
@@ -855,25 +878,25 @@ func main() {
 		stats:        stats,
 	}
 
-	// Initialize Model
+	// Spinner
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+
 	m := model{
-		engine: engine,
-		logs:   make([]string, 0),
+		engine:   engine,
+		spinner:  sp,
+		results:  make([]ResultMsg, 0),
+		state:    stateRunning,
+		viewport: viewport.New(0, 0),
 	}
 
-	// Create Program
-	p := tea.NewProgram(m)
+	p := tea.NewProgram(m, tea.WithAltScreen())
 	engine.program = p
 
-	// Run
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error running program: %v\n", err)
+		fmt.Printf("Error: %v\n", err)
 		os.Exit(2)
-	}
-
-	// Summary
-	if !rootConfig.Quiet {
-		printSummary(stats, time.Since(startTime))
 	}
 
 	if stats.errors.Load() > 0 || stats.corrupted.Load() > 0 {
