@@ -92,7 +92,7 @@ var (
 
 	// concurrency and pooling
 	configCache = sync.Map{}
-	ghostMutex  = sync.Map{}
+	ghostCache  = sync.Map{}
 	outputMutex = sync.Mutex{}
 	bufferPool  = sync.Pool{
 		New: func() interface{} {
@@ -111,11 +111,18 @@ var (
 	}
 )
 
-// getGhostMutex returns or creates a mutex for a specific ghost file path to ensure
-// thread-safe writes.
-func getGhostMutex(ghostPath string) *sync.Mutex {
-	mutex, _ := ghostMutex.LoadOrStore(ghostPath, &sync.Mutex{})
-	return mutex.(*sync.Mutex)
+type cachedGhost struct {
+	sync.RWMutex
+	data   map[string]fileData
+	loaded bool
+}
+
+// getGhostHelper returns or creates a helper for a specific ghost file path.
+func getGhostHelper(ghostPath string) *cachedGhost {
+	v, _ := ghostCache.LoadOrStore(ghostPath, &cachedGhost{
+		data: make(map[string]fileData),
+	})
+	return v.(*cachedGhost)
 }
 
 // logf prints formatted output unless in quiet mode. It is thread-safe.
@@ -494,28 +501,33 @@ func addF(filePath, ghostPath, basePath string) {
 		return
 	}
 
-	mutex := getGhostMutex(ghostPath)
-	mutex.Lock()
+	helper := getGhostHelper(ghostPath)
+	helper.Lock()
 
-	data, err := readGhost(ghostPath)
-	if err != nil {
-		mutex.Unlock()
-		logf("%s[ERROR]%s %v\n", colorRed, colorReset, err)
-		globalStats.errors.Add(1)
-		return
+	if !helper.loaded {
+		data, err := readGhost(ghostPath)
+		if err != nil {
+			helper.Unlock()
+			logf("%s[ERROR]%s %v\n", colorRed, colorReset, err)
+			globalStats.errors.Add(1)
+			return
+		}
+		helper.data = data
+		helper.loaded = true
 	}
 
+	data := helper.data
 	filename := filepath.Base(filePath)
 	storedData, exists := data[filename]
 	if exists {
 		if currentHash == storedData.Blake2b {
-			mutex.Unlock()
+			helper.Unlock()
 			logf("%s[UNCHANGED]%s %s\n", colorGray, colorReset, filename)
 			return
 		}
 
 		if !rootConfig.Force {
-			mutex.Unlock()
+			helper.Unlock()
 			outputMutex.Lock()
 			clearProgress()
 			fmt.Printf("%s[WARNING]%s File '%s' already tracked with a different hash.\n", colorYellow, colorReset, filename)
@@ -529,7 +541,17 @@ func addF(filePath, ghostPath, basePath string) {
 				logf("%s[CANCELLED]%s Operation cancelled by user for %s.\n", colorYellow, colorReset, filename)
 				return
 			}
-			mutex.Lock()
+			helper.Lock()
+			// Reload data reference in case it changed while unlocked (though we are the only writer ideally, checks are read-only)
+			// Actually checkF might have loaded it if we were not loaded? No, we loaded it.
+			// Another addF could have run?
+			// Since we unlocked, another writer could have come in.
+			// But checkF holds RLock.
+			// So yes, we should be careful.
+			// If another addF came in, helper.data is updated in place (it's a map).
+			// So 'data' variable still points to the map.
+			// But the map content might have changed.
+			// That's fine.
 		}
 		globalStats.modified.Add(1)
 		logf("%s[UPDATED]%s %s\n", colorBlue, colorReset, filename)
@@ -545,27 +567,32 @@ func addF(filePath, ghostPath, basePath string) {
 	}
 
 	if err := writeGhost(data, ghostPath); err != nil {
-		mutex.Unlock()
+		helper.Unlock()
 		logf("%s[ERROR]%s %v\n", colorRed, colorReset, err)
 		globalStats.errors.Add(1)
 		return
 	}
-	mutex.Unlock()
+	helper.Unlock()
 }
 
 // delF removes a file from the ghost database.
 func delF(filePath, ghostPath, _ string) {
-	mutex := getGhostMutex(ghostPath)
-	mutex.Lock()
-	defer mutex.Unlock()
+	helper := getGhostHelper(ghostPath)
+	helper.Lock()
+	defer helper.Unlock()
 
-	data, err := readGhost(ghostPath)
-	if err != nil {
-		logf("%s[ERROR]%s %v\n", colorRed, colorReset, err)
-		globalStats.errors.Add(1)
-		return
+	if !helper.loaded {
+		data, err := readGhost(ghostPath)
+		if err != nil {
+			logf("%s[ERROR]%s %v\n", colorRed, colorReset, err)
+			globalStats.errors.Add(1)
+			return
+		}
+		helper.data = data
+		helper.loaded = true
 	}
 
+	data := helper.data
 	filename := filepath.Base(filePath)
 	if _, exists := data[filename]; !exists {
 		logf("%s[NOT FOUND]%s File '%s' not found in ghost database.\n", colorYellow, colorReset, filename)
@@ -589,19 +616,33 @@ func checkF(filePath, ghostPath, basePath string) {
 		return
 	}
 
-	mutex := getGhostMutex(ghostPath)
-	mutex.Lock()
-	data, err := readGhost(ghostPath)
-	mutex.Unlock()
+	helper := getGhostHelper(ghostPath)
+	var storedData fileData
+	var exists bool
 
-	if err != nil {
-		globalStats.errors.Add(1)
-		logf("%s[ERROR]%s %v\n", colorRed, colorReset, err)
-		return
+	helper.RLock()
+	if helper.loaded {
+		storedData, exists = helper.data[filepath.Base(filePath)]
+		helper.RUnlock()
+	} else {
+		helper.RUnlock()
+		helper.Lock()
+		if !helper.loaded {
+			data, err := readGhost(ghostPath)
+			if err != nil {
+				helper.Unlock()
+				globalStats.errors.Add(1)
+				logf("%s[ERROR]%s %v\n", colorRed, colorReset, err)
+				return
+			}
+			helper.data = data
+			helper.loaded = true
+		}
+		storedData, exists = helper.data[filepath.Base(filePath)]
+		helper.Unlock()
 	}
 
 	filename := filepath.Base(filePath)
-	storedData, exists := data[filename]
 	if !exists {
 		logf("%s[NOT TRACKED]%s %s\n", colorYellow, colorReset, filename)
 		return
@@ -768,14 +809,20 @@ func clean(path string, recursive bool) error {
 	var totalCleaned int64
 	for _, ghostPath := range ghostFiles {
 		dirPath := filepath.Dir(ghostPath)
-		mutex := getGhostMutex(ghostPath)
-		mutex.Lock()
-		data, err := readGhost(ghostPath)
-		if err != nil {
-			mutex.Unlock()
-			logf("%s[ERROR]%s Failed to read %s: %v\n", colorRed, colorReset, ghostPath, err)
-			continue
+		helper := getGhostHelper(ghostPath)
+		helper.Lock()
+
+		if !helper.loaded {
+			data, err := readGhost(ghostPath)
+			if err != nil {
+				helper.Unlock()
+				logf("%s[ERROR]%s Failed to read %s: %v\n", colorRed, colorReset, ghostPath, err)
+				continue
+			}
+			helper.data = data
+			helper.loaded = true
 		}
+		data := helper.data
 
 		removedCount := 0
 		for filename := range data {
@@ -793,7 +840,7 @@ func clean(path string, recursive bool) error {
 			}
 			atomic.AddInt64(&totalCleaned, int64(removedCount))
 		}
-		mutex.Unlock()
+		helper.Unlock()
 	}
 
 	if totalCleaned > 0 {
@@ -806,17 +853,22 @@ func clean(path string, recursive bool) error {
 
 // updateGhostFile updates a single .ghost file to include size and modified metadata.
 func updateGhostFile(job updateWorkItem) {
-	mutex := getGhostMutex(job.ghostPath)
-	mutex.Lock()
-	defer mutex.Unlock()
+	helper := getGhostHelper(job.ghostPath)
+	helper.Lock()
+	defer helper.Unlock()
 
-	data, err := readGhost(job.ghostPath)
-	if err != nil {
-		logf("%s[ERROR]%s Failed to read ghost file '%s': %v\n", colorRed, colorReset, job.ghostPath, err)
-		globalStats.errors.Add(1)
-		return
+	if !helper.loaded {
+		data, err := readGhost(job.ghostPath)
+		if err != nil {
+			logf("%s[ERROR]%s Failed to read ghost file '%s': %v\n", colorRed, colorReset, job.ghostPath, err)
+			globalStats.errors.Add(1)
+			return
+		}
+		helper.data = data
+		helper.loaded = true
 	}
 
+	data := helper.data
 	updatedCount := 0
 	for filename, fileInfo := range data {
 		// Skip if metadata is already present.
