@@ -146,9 +146,15 @@ func printProgress(current, total int64, operation string) {
 	outputMutex.Lock()
 	defer outputMutex.Unlock()
 
-	percentage := float64(current) / float64(total) * 100
-	fmt.Printf("\r%s[%s] Processing: %d/%d (%.1f%%)%s",
-		colorCyan, operation, current, total, percentage, colorReset)
+	if total > 0 {
+		percentage := float64(current) / float64(total) * 100
+		fmt.Printf("%s[%s] Processing: %d/%d (%.1f%%)%s",
+			colorCyan, operation, current, total, percentage, colorReset)
+	} else {
+		// When total is 0, show a running count instead of a percentage.
+		fmt.Printf("%s[%s] Processing items: %d",
+			colorCyan, operation, current)
+	}
 }
 
 // clearProgress clears the progress line from the terminal.
@@ -367,8 +373,12 @@ func calcHash(path string) (string, error) {
 	defer bufferPool.Put(bufPtr)
 	buffer := *bufPtr
 	bufSize := getBufferSize(fileSize)
-	if len(buffer) != bufSize {
+	if cap(buffer) < bufSize {
+		// Pooled buffer is too small, a new one will be allocated for this operation.
 		buffer = make([]byte, bufSize)
+	} else {
+		// Reuse pooled buffer by slicing it to the required size.
+		buffer = buffer[:bufSize]
 	}
 
 	if _, err := io.CopyBuffer(h, file, buffer); err != nil {
@@ -649,9 +659,33 @@ func processFiles(path string, recursive bool, operation func(string, string, st
 	}
 
 	logf("%s[PROCESSING]%s Directory: %s (recursive: %v)\n", colorCyan, colorReset, path, recursive)
-	var workItems []workItem
 
-	walkFunc := func(filePath string, d fs.DirEntry, err error) error {
+	jobChan := make(chan workItem, workerQueueSize)
+	var wg sync.WaitGroup
+	var processed atomic.Int64
+
+	numWorkers := rootConfig.Parallel
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobChan {
+				operation(job.filePath, job.ghostPath, job.basePath)
+				current := processed.Add(1)
+				// With a streaming pipeline, we don't know the total number of files,
+				// so we show a running count instead of a percentage.
+				if current%progressUpdateFreq == 0 {
+					printProgress(current, 0, operationName)
+				}
+			}
+		}()
+	}
+
+	walkErr := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			logf("%s[ERROR]%s Accessing '%s': %v\n", colorRed, colorReset, filePath, err)
 			return nil // Continue walking
@@ -682,19 +716,19 @@ func processFiles(path string, recursive bool, operation func(string, string, st
 		if !recursive {
 			localGhostPath = filepath.Join(path, ".ghost")
 		}
-		workItems = append(workItems, workItem{filePath, localGhostPath, path})
+		jobChan <- workItem{filePath, localGhostPath, path}
 		return nil
+	})
+
+	close(jobChan)
+	wg.Wait()
+	clearProgress()
+
+	if walkErr != nil {
+		return fmt.Errorf("error processing directory: %w", walkErr)
 	}
 
-	if err := filepath.WalkDir(path, walkFunc); err != nil {
-		return fmt.Errorf("error processing directory: %w", err)
-	}
-
-	runWorkers(workItems, func(job workItem) {
-		operation(job.filePath, job.ghostPath, job.basePath)
-	}, rootConfig.Parallel, operationName)
-
-	logf("%s[COMPLETED]%s Processed %d potential files\n", colorGreen, colorReset, len(workItems))
+	logf("%s[COMPLETED]%s Processed %d potential files\n", colorGreen, colorReset, processed.Load())
 	return nil
 }
 
