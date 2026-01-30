@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"hash"
@@ -292,7 +293,7 @@ func calcHashMmap(path string) (string, error) {
 	h.Reset()
 
 	h.Write(data)
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func calcHash(path string, bufferSize int) (string, error) {
@@ -336,7 +337,7 @@ func calcHash(path string, bufferSize int) (string, error) {
 		return "", fmt.Errorf("failed to read: %w", err)
 	}
 
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func readGhost(ghostPath string) (map[string]fileData, error) {
