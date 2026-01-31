@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"hash"
@@ -292,7 +293,7 @@ func calcHashMmap(path string) (string, error) {
 	h.Reset()
 
 	h.Write(data)
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func calcHash(path string, bufferSize int) (string, error) {
@@ -336,7 +337,7 @@ func calcHash(path string, bufferSize int) (string, error) {
 		return "", fmt.Errorf("failed to read: %w", err)
 	}
 
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func readGhost(ghostPath string) (map[string]fileData, error) {
@@ -425,6 +426,7 @@ func (e *Engine) scanDirectory(path string, jobs chan<- DirJob) {
 
 	var files []string
 	var subdirs []string
+	hasGhost := false
 
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -435,6 +437,9 @@ func (e *Engine) scanDirectory(path string, jobs chan<- DirJob) {
 			}
 			subdirs = append(subdirs, entry.Name())
 		} else {
+			if entry.Name() == ".ghost" {
+				hasGhost = true
+			}
 			files = append(files, entry.Name())
 		}
 	}
@@ -443,11 +448,7 @@ func (e *Engine) scanDirectory(path string, jobs chan<- DirJob) {
 		return
 	}
 
-	hasGhost := false
 	ghostPath := filepath.Join(path, ".ghost")
-	if _, err := os.Stat(ghostPath); err == nil {
-		hasGhost = true
-	}
 
 	validFiles := []string{}
 	for _, f := range files {
