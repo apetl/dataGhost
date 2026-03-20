@@ -148,11 +148,11 @@ func printProgress(current, total int64, operation string) {
 
 	if total > 0 {
 		percentage := float64(current) / float64(total) * 100
-		fmt.Printf("%s[%s] Processing: %d/%d (%.1f%%)%s",
+		fmt.Printf("%s[%s] Processing: %d/%d (%.1f%%)%s",
 			colorCyan, operation, current, total, percentage, colorReset)
 	} else {
 		// When total is 0, show a running count instead of a percentage.
-		fmt.Printf("%s[%s] Processing items: %d",
+		fmt.Printf("%s[%s] Processing items: %d",
 			colorCyan, operation, current)
 	}
 }
@@ -616,6 +616,7 @@ func checkF(filePath, ghostPath, basePath string) {
 		return
 	}
 
+	// forceCheck is true by default (full hash); false only when -qc is passed.
 	if !forceCheck && !needsRehash(stat, storedData) {
 		globalStats.ok.Add(1)
 		logf("%s[OK]%s %s %s(cached)%s\n", colorGreen, colorReset, filename, colorGray, colorReset)
@@ -999,7 +1000,7 @@ func help() {
 			"  " + colorCyan + "-r" + colorReset + "              Process directories recursively\n" +
 			"  " + colorCyan + "-p" + colorReset + " N            Set number of parallel workers (default: CPU count)\n" +
 			"  " + colorCyan + "-f" + colorReset + "              Force operations without prompts (e.g., overwrite)\n" +
-			"  " + colorCyan + "-fc" + colorReset + "             Force hash re-calculation (ignores cached size/modtime check)\n" +
+			"  " + colorCyan + "-qc" + colorReset + "             Quick check: skip rehash if size/modtime unchanged (does not detect bit rot)\n" +
 			"  " + colorCyan + "-q" + colorReset + "              Quiet mode (minimal output)\n" +
 			"  " + colorCyan + "-c" + colorReset + "              Load .ghostconf from target directory\n" +
 			"  " + colorCyan + "-cf" + colorReset + " " + colorGray + "FILE" + colorReset + "        Load config from a specific file\n" +
@@ -1047,6 +1048,7 @@ func main() {
 		quietMode        bool
 		recursive        bool
 		forceOverwrite   bool
+		quickCheck       bool
 	)
 	flag.BoolVar(&useConfig, "c", false, "Load .ghostconf from target directory")
 	flag.BoolVar(&useStrictConfig, "cs", false, "Load .ghostconf (strict mode)")
@@ -1056,8 +1058,14 @@ func main() {
 	flag.BoolVar(&quietMode, "q", false, "Quiet mode")
 	flag.BoolVar(&recursive, "r", false, "Process recursively")
 	flag.BoolVar(&forceOverwrite, "f", false, "Force operations")
-	flag.BoolVar(&forceCheck, "fc", false, "Force hash calculation (ignore cache)")
+	flag.BoolVar(&quickCheck, "qc", false, "Quick check (use cached size/modtime, skip rehash if unchanged)")
 	flag.Parse()
+
+	// Force check (full rehash) is the default; -qc disables it.
+	forceCheck = true
+	if isFlagSet("qc") {
+		forceCheck = false
+	}
 
 	if flag.NArg() < 2 {
 		help()
@@ -1108,6 +1116,9 @@ func main() {
 	case "del":
 		err = processFiles(path, recursive, delF, "delete")
 	case "check":
+		if !forceCheck {
+			fmt.Printf("%s[WARNING] Quick check mode enabled, this does NOT detect bit rot. Run without -qc for full integrity verification.%s\n", colorRed, colorReset)
+		}
 		err = processFiles(path, recursive, checkF, "check")
 	case "clean":
 		err = clean(path, recursive)
