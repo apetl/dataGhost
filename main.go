@@ -435,7 +435,9 @@ func calcHash(path string, cfgBuffer int) (string, error) {
 	}
 
 	_, copyErr := io.CopyBuffer(h, f, buf)
-	bufferPool.Put(bufPtr)
+	if cap(buf) <= defaultBuffer {
+		bufferPool.Put(bufPtr)
+	}
 	if copyErr != nil {
 		hashPool.Put(h)
 		return "", fmt.Errorf("failed to read file '%s': %w", path, copyErr)
@@ -583,6 +585,10 @@ func (a *app) addF(ctx context.Context, filePath, ghostPath, basePath string) {
 	filename := filepath.Base(filePath)
 
 	// Prompt outside the lock to avoid holding it during blocking I/O.
+	// Store the hash to prompt about, then re-check inside the lock before writing.
+	var promptHash string
+	var promptFilename string
+	shouldPrompt := false
 	if !a.cfg.Force {
 		mu := a.getGhostMutex(ghostPath)
 		mu.Lock()
@@ -590,23 +596,27 @@ func (a *app) addF(ctx context.Context, filePath, ghostPath, basePath string) {
 		mu.Unlock()
 		if preErr == nil {
 			if stored, exists := preData[filename]; exists && stored.Blake2b != currentHash {
-				a.outputMu.Lock()
-				a.clearProgress()
-				fmt.Printf("%s[WARNING]%s '%s' already tracked with a different hash.\n", colorYellow, colorReset, filename)
-				fmt.Printf("  Existing: %s\n  Current:  %s\n", stored.Blake2b, currentHash)
-				fmt.Print("  Overwrite? (y/n): ")
-				var resp string
-				fmt.Scanln(&resp)
-				a.outputMu.Unlock()
-				if resp != "y" && resp != "Y" {
-					a.logf("%s[CANCELLED]%s %s\n", colorYellow, colorReset, filename)
-					return
-				}
+				shouldPrompt = true
+				promptHash = stored.Blake2b
+				promptFilename = filename
 			}
 		} else {
-			// readGhost failed — treat as an error so exit code reflects it.
 			a.logf("%s[ERROR]%s %v\n", colorRed, colorReset, preErr)
 			a.stats.errors.Add(1)
+			return
+		}
+	}
+	if shouldPrompt {
+		a.outputMu.Lock()
+		a.clearProgress()
+		fmt.Printf("%s[WARNING]%s '%s' already tracked with a different hash.\n", colorYellow, colorReset, promptFilename)
+		fmt.Printf("  Existing: %s\n  Current:  %s\n", promptHash, currentHash)
+		fmt.Print("  Overwrite? (y/n): ")
+		a.outputMu.Unlock()
+		var resp string
+		fmt.Scanln(&resp)
+		if resp != "y" && resp != "Y" {
+			a.logf("%s[CANCELLED]%s %s\n", colorYellow, colorReset, promptFilename)
 			return
 		}
 	}
@@ -627,6 +637,9 @@ func (a *app) addF(ctx context.Context, filePath, ghostPath, basePath string) {
 		if currentHash == stored.Blake2b {
 			a.logf("%s[UNCHANGED]%s %s\n", colorGray, colorReset, filename)
 			return
+		}
+		if shouldPrompt && stored.Blake2b != promptHash {
+			a.logf("%s[WARN]%s Ghost data changed during prompt. Proceeding with update.\n", colorYellow, colorReset)
 		}
 		a.stats.modified.Add(1)
 		a.logf("%s[UPDATED]%s %s\n", colorBlue, colorReset, filename)
@@ -1229,7 +1242,7 @@ func main() {
 			func(ctx context.Context, fp, gp, bp string) { a.delF(ctx, fp, gp, bp) }, "delete")
 	case "check":
 		if !a.alwaysRehash {
-			fmt.Printf("%s[WARNING]%s Quick check mode: does NOT detect bit rot.\n", colorRed, colorReset)
+			fmt.Printf("%s[WARNING]%s Quick check mode: does NOT detect bit rot.\n", colorYellow, colorReset)
 		}
 		opErr = a.processFiles(ctx, path, recursive,
 			func(ctx context.Context, fp, gp, bp string) { a.checkF(ctx, fp, gp, bp) }, "check")
