@@ -114,11 +114,11 @@ const boundedMapCap = 1024
 
 // app holds all runtime state, eliminating package-level globals.
 type app struct {
-	cfg        conf
-	strict     bool
-	forceCheck bool
-	startTime  time.Time
-	stats      stats
+	cfg          conf
+	strict       bool
+	alwaysRehash bool
+	startTime    time.Time
+	stats        stats
 
 	// configCache: bounded by boundedMapCap unique directories.
 	configCache *boundedMap[conf]
@@ -436,12 +436,12 @@ func calcHash(path string, cfgBuffer int) (string, error) {
 
 	_, copyErr := io.CopyBuffer(h, f, buf)
 	bufferPool.Put(bufPtr)
-	hashStr := fmt.Sprintf("%x", h.Sum(nil))
-	hashPool.Put(h)
-
 	if copyErr != nil {
+		hashPool.Put(h)
 		return "", fmt.Errorf("failed to read file '%s': %w", path, copyErr)
 	}
+	hashStr := fmt.Sprintf("%x", h.Sum(nil))
+	hashPool.Put(h)
 	return hashStr, nil
 }
 
@@ -485,6 +485,10 @@ func writeGhost(data map[string]fileData, ghostPath string) error {
 	if _, err := tmp.Write(b); err != nil {
 		tmp.Close()
 		return fmt.Errorf("failed to write temporary file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to sync temporary file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("failed to close temporary file: %w", err)
@@ -705,7 +709,7 @@ func (a *app) checkF(ctx context.Context, filePath, ghostPath, basePath string) 
 		return
 	}
 
-	if !a.forceCheck && !needsRehash(st, stored) {
+	if !a.alwaysRehash && !needsRehash(st, stored) {
 		a.stats.ok.Add(1)
 		a.logf("%s[OK]%s %s %s(cached)%s\n", colorGreen, colorReset, filename, colorGray, colorReset)
 		return
@@ -774,6 +778,10 @@ func (a *app) processFiles(ctx context.Context, path string, recursive bool,
 	}
 
 	// Resolve config once per directory during the walk.
+	// dirConfigCache is accessed only from the WalkDir callback, which runs on
+	// a single goroutine, so no synchronisation is needed here. If the walk is
+	// ever parallelised this cache must be made goroutine-safe (e.g. replaced
+	// with a.configCache / sync.Map).
 	dirConfigCache := make(map[string]conf)
 	getDirCfg := func(dir string) conf {
 		if c, ok := dirConfigCache[dir]; ok {
@@ -843,6 +851,38 @@ func (a *app) processFiles(ctx context.Context, path string, recursive bool,
 	return nil
 }
 
+// cleanGhostFile removes entries for missing files from a single ghost file.
+// Returns the number of entries removed. Uses defer for consistent mutex release.
+func (a *app) cleanGhostFile(ghostPath string) int64 {
+	dirPath := filepath.Dir(ghostPath)
+	mu := a.getGhostMutex(ghostPath)
+	mu.Lock()
+	defer mu.Unlock()
+
+	data, err := readGhost(ghostPath)
+	if err != nil {
+		a.logf("%s[ERROR]%s Failed to read %s: %v\n", colorRed, colorReset, ghostPath, err)
+		a.stats.errors.Add(1)
+		return 0
+	}
+	removed := 0
+	for filename := range data {
+		if _, err := os.Stat(filepath.Join(dirPath, filename)); os.IsNotExist(err) {
+			a.logf("%s[MISSING]%s Removing entry for %s\n", colorYellow, colorReset, filename)
+			delete(data, filename)
+			removed++
+		}
+	}
+	if removed > 0 {
+		if err := writeGhost(data, ghostPath); err != nil {
+			a.logf("%s[ERROR]%s Failed to write %s: %v\n", colorRed, colorReset, ghostPath, err)
+			a.stats.errors.Add(1)
+			return 0
+		}
+	}
+	return int64(removed)
+}
+
 func (a *app) clean(ctx context.Context, path string, recursive bool) error {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -880,33 +920,8 @@ func (a *app) clean(ctx context.Context, path string, recursive bool) error {
 		if ctx.Err() != nil {
 			break
 		}
-		dirPath := filepath.Dir(ghostPath)
-		mu := a.getGhostMutex(ghostPath)
-		mu.Lock()
-		data, err := readGhost(ghostPath)
-		if err != nil {
-			mu.Unlock()
-			a.logf("%s[ERROR]%s Failed to read %s: %v\n", colorRed, colorReset, ghostPath, err)
-			a.stats.errors.Add(1)
-			continue
-		}
-		removed := 0
-		for filename := range data {
-			if _, err := os.Stat(filepath.Join(dirPath, filename)); os.IsNotExist(err) {
-				a.logf("%s[MISSING]%s Removing entry for %s\n", colorYellow, colorReset, filename)
-				delete(data, filename)
-				removed++
-			}
-		}
-		if removed > 0 {
-			if err := writeGhost(data, ghostPath); err != nil {
-				a.logf("%s[ERROR]%s Failed to write %s: %v\n", colorRed, colorReset, ghostPath, err)
-				a.stats.errors.Add(1)
-			} else {
-				totalCleaned += int64(removed)
-			}
-		}
-		mu.Unlock()
+		cleaned := a.cleanGhostFile(ghostPath)
+		totalCleaned += cleaned
 	}
 
 	if totalCleaned > 0 {
@@ -1070,12 +1085,26 @@ func (a *app) printSummary() {
 	fmt.Println(bot)
 }
 
+// boxLine returns a single bordered line padded to exactly w inner characters.
+func boxLine(w int, text string) string {
+	pad := w - len(text)
+	if pad < 0 {
+		pad = 0
+	}
+	lp := pad / 2
+	rp := pad - lp
+	return colorBlue + "║" + colorReset + strings.Repeat(" ", lp) + text + strings.Repeat(" ", rp) + colorBlue + "║" + colorReset + "\n"
+}
+
 func help() {
+	const w = 58 // inner width of the help box
+	top := colorBlue + "╔" + strings.Repeat("═", w) + "╗" + colorReset + "\n"
+	bot := colorBlue + "╚" + strings.Repeat("═", w) + "╝" + colorReset + "\n"
 	fmt.Print(
-		colorBlue + "╔══════════════════════════════════════════════════════════╗" + colorReset + "\n" +
-			colorBlue + "║                    dataGhost " + appVersion + "                        ║" + colorReset + "\n" +
-			colorBlue + "║            File Integrity Tracking Utility               ║" + colorReset + "\n" +
-			colorBlue + "╚══════════════════════════════════════════════════════════╝" + colorReset + "\n\n" +
+		top +
+			boxLine(w, "dataGhost "+appVersion) +
+			boxLine(w, "File Integrity Tracking Utility") +
+			bot + "\n" +
 			colorYellow + "USAGE:" + colorReset + "\n" +
 			"  dataGhost [OPTIONS] COMMAND " + colorGray + "[PATH]" + colorReset + "\n\n" +
 			colorYellow + "COMMANDS:" + colorReset + "\n" +
@@ -1155,7 +1184,7 @@ func main() {
 	path := flag.Arg(1)
 
 	a := newApp()
-	a.forceCheck = !isFlagSet("qc") // full rehash by default; -qc disables it
+	a.alwaysRehash = !isFlagSet("qc") // full rehash by default; -qc disables it
 
 	useAnyConfig := useConfig || useStrictConfig || configFile != "" || strictConfigFile != ""
 	isStrict := useStrictConfig || strictConfigFile != ""
@@ -1199,7 +1228,7 @@ func main() {
 		opErr = a.processFiles(ctx, path, recursive,
 			func(ctx context.Context, fp, gp, bp string) { a.delF(ctx, fp, gp, bp) }, "delete")
 	case "check":
-		if !a.forceCheck {
+		if !a.alwaysRehash {
 			fmt.Printf("%s[WARNING]%s Quick check mode: does NOT detect bit rot.\n", colorRed, colorReset)
 		}
 		opErr = a.processFiles(ctx, path, recursive,
@@ -1235,10 +1264,11 @@ func main() {
 	if a.stats.corrupted.Load() > 0 {
 		exitCode = 1
 	}
-	// modified > 0 during check means a file changed since it was recorded.
 	// modified > 0 during add means an existing entry was overwritten with a
 	// new hash — flag it so callers can detect unexpected changes.
-	if a.stats.modified.Load() > 0 && (command == "check" || command == "add") {
+	// Note: checkF never increments modified; corruption during check is
+	// reflected solely by corrupted (already handled above).
+	if a.stats.modified.Load() > 0 && command == "add" {
 		exitCode = 1
 	}
 	// Errors always override to exit 2.
