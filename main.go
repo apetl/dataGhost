@@ -143,6 +143,8 @@ func main() {
 		opErr = a.Clean(ctx, path, recursive)
 	case "update":
 		opErr = a.Update(ctx, path, recursive)
+	case "list":
+		opErr = a.ListGhosts(path, recursive)
 	default:
 		fmt.Printf("%s[ERROR]%s Unknown command: %s\n", output.ColorRed, output.ColorReset, command)
 		output.Help()
@@ -166,7 +168,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	if !a.Config.Quiet || a.JSONOutput {
+	if command != "list" && (!a.Config.Quiet || a.JSONOutput) {
 		a.PrintSummary()
 	}
 

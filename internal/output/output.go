@@ -1,10 +1,12 @@
-// Package output provides terminal formatting, colors, and help text.
+// Package output provides terminal formatting, colors, progress bars, and help text.
 package output
 
 import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // AppVersion is the current dataGhost version.
@@ -46,6 +48,63 @@ func IsStdinInteractive() bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
+// ProgressBar renders a visual progress bar with percentage.
+type ProgressBar struct {
+	mu        sync.Mutex
+	width     int
+	operation string
+}
+
+// NewProgressBar creates a progress bar with the given display width.
+func NewProgressBar(width int) *ProgressBar {
+	if width < 10 {
+		width = 40
+	}
+	return &ProgressBar{width: width}
+}
+
+// Render returns the progress bar string for current/total.
+func (pb *ProgressBar) Render(current, total int64, operation string) string {
+	if total <= 0 {
+		return fmt.Sprintf("%s[%s] Processing items: %d%s", ColorCyan, operation, current, ColorReset)
+	}
+	pct := float64(current) / float64(total) * 100
+	filled := int(float64(pb.width) * float64(current) / float64(total))
+	if filled > pb.width {
+		filled = pb.width
+	}
+	bar := strings.Repeat("▓", filled) + strings.Repeat("░", pb.width-filled)
+	return fmt.Sprintf("%s[%s] %s %3.0f%% (%d/%d)%s", ColorCyan, operation, bar, pct, current, total, ColorReset)
+}
+
+// AtomicProgress wraps a ProgressBar with thread-safe current/total tracking.
+type AtomicProgress struct {
+	pb      *ProgressBar
+	current atomic.Int64
+	total   int64
+	op      string
+}
+
+// NewAtomicProgress creates a thread-safe progress tracker.
+func NewAtomicProgress(total int64, operation string) *AtomicProgress {
+	return &AtomicProgress{
+		pb:    NewProgressBar(40),
+		total: total,
+		op:    operation,
+	}
+}
+
+// Inc increments the progress counter and returns the rendered bar.
+func (ap *AtomicProgress) Inc() string {
+	cur := ap.current.Add(1)
+	return ap.pb.Render(cur, ap.total, ap.op)
+}
+
+// Current returns the current progress count.
+func (ap *AtomicProgress) Current() int64 {
+	return ap.current.Load()
+}
+
 // BoxLine returns a single bordered line padded to exactly w inner characters.
 func BoxLine(w int, text string) string {
 	pad := w - len(text)
@@ -75,6 +134,7 @@ func Help() {
 			"  " + ColorCyan + "check" + ColorReset + "     Verify file integrity\n" +
 			"  " + ColorYellow + "clean" + ColorReset + "     Remove missing file entries from tracking\n" +
 			"  " + ColorMagenta + "update" + ColorReset + "    Update old .ghost files with size/modification metadata\n" +
+			"  " + ColorBlue + "list" + ColorReset + "      List tracked files from .ghost file(s)\n" +
 			"  " + ColorBlue + "version" + ColorReset + "   Print version information\n\n" +
 			ColorYellow + "OPTIONS:" + ColorReset + "\n" +
 			"  " + ColorCyan + "-r" + ColorReset + "              Process directories recursively\n" +

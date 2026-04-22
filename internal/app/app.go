@@ -20,9 +20,8 @@ import (
 )
 
 const (
-	boundedMapCap      = 1024
-	workerQueueSize    = 1000
-	progressUpdateFreq = 10
+	boundedMapCap   = 1024
+	workerQueueSize = 1000
 )
 
 // Stats tracks operation statistics with thread-safe atomic operations.
@@ -84,7 +83,11 @@ func (b *boundedMap[V]) loadOrStore(key string, newVal V) V {
 		return v
 	}
 	if len(b.m) >= b.cap {
-		b.m = make(map[string]V, b.cap)
+		// Evict one arbitrary entry instead of clearing the entire map.
+		for k := range b.m {
+			delete(b.m, k)
+			break
+		}
 	}
 	b.m[key] = newVal
 	return newVal
@@ -95,15 +98,6 @@ func (b *boundedMap[V]) load(key string) (V, bool) {
 	defer b.mu.Unlock()
 	v, ok := b.m[key]
 	return v, ok
-}
-
-func (b *boundedMap[V]) store(key string, val V) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.m) >= b.cap {
-		b.m = make(map[string]V, b.cap)
-	}
-	b.m[key] = val
 }
 
 // App holds all runtime state for a dataGhost operation.
@@ -158,26 +152,20 @@ func (a *App) JSONLog(event map[string]any) {
 	fmt.Println(string(b))
 }
 
-// PrintProgress renders a progress line to the terminal.
+// PrintProgress renders a progress bar to the terminal.
 func (a *App) PrintProgress(current, total int64, operation string) {
-	if !a.Config.ShowProgress || a.Config.Quiet {
+	if !a.Config.ShowProgress || a.Config.Quiet || a.JSONOutput {
 		return
 	}
 	a.outputMu.Lock()
 	defer a.outputMu.Unlock()
+	pb := output.NewProgressBar(40)
 	fmt.Print("\r\033[K")
-	if total > 0 {
-		pct := float64(current) / float64(total) * 100
-		fmt.Printf("%s[%s] Processing: %d/%d (%.1f%%)%s",
-			output.ColorCyan, operation, current, total, pct, output.ColorReset)
-	} else {
-		fmt.Printf("%s[%s] Processing items: %d%s",
-			output.ColorCyan, operation, current, output.ColorReset)
-	}
+	fmt.Print(pb.Render(current, total, operation))
 }
 
 func (a *App) clearProgress() {
-	if !a.Config.ShowProgress || a.Config.Quiet {
+	if !a.Config.ShowProgress || a.Config.Quiet || a.JSONOutput {
 		return
 	}
 	fmt.Print("\r\033[K")
@@ -488,7 +476,7 @@ func (a *App) ProcessFiles(ctx context.Context, path string, recursive bool,
 				}
 				operation(ctx, job.filePath, job.ghostPath, job.basePath)
 				cur := processed.Add(1)
-				if cur%progressUpdateFreq == 0 {
+				if cur%10 == 0 {
 					a.PrintProgress(cur, 0, operationName)
 				}
 			}
@@ -716,6 +704,69 @@ func (a *App) updateGhostFile(ctx context.Context, job updateWorkItem) {
 	}
 }
 
+// ListGhosts prints a formatted table of all tracked files in a .ghost file or directory.
+func (a *App) ListGhosts(path string, recursive bool) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("failed to access path '%s': %w", path, err)
+	}
+
+	var ghostPaths []string
+	if !fi.IsDir() && filepath.Base(path) == ".ghost" {
+		ghostPaths = append(ghostPaths, path)
+	} else if fi.IsDir() {
+		err := filepath.WalkDir(path, func(fp string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !recursive && d.IsDir() && fp != path {
+				return filepath.SkipDir
+			}
+			if !d.IsDir() && d.Name() == ".ghost" {
+				ghostPaths = append(ghostPaths, fp)
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("error walking directory: %w", err)
+		}
+	} else {
+		return fmt.Errorf("path must be a directory or a .ghost file")
+	}
+
+	if len(ghostPaths) == 0 {
+		a.Logf("%s[INFO]%s No .ghost files found\n", output.ColorCyan, output.ColorReset)
+		return nil
+	}
+
+	for _, gp := range ghostPaths {
+		data, err := ghost.ReadGhost(gp)
+		if err != nil {
+			a.Logf("%s[ERROR]%s Failed to read '%s': %v\n", output.ColorRed, output.ColorReset, gp, err)
+			continue
+		}
+		if len(data) == 0 {
+			a.Logf("%s[INFO]%s %s: (empty)\n", output.ColorCyan, output.ColorReset, gp)
+			continue
+		}
+
+		a.outputMu.Lock()
+		fmt.Printf("\n%s[GHOST]%s %s\n", output.ColorBlue, output.ColorReset, gp)
+		fmt.Printf("  %-40s %-66s %10s %20s\n", "FILE", "BLAKE2B", "SIZE", "MODIFIED")
+		fmt.Printf("  %s\n", strings.Repeat("─", 140))
+		for filename, fd := range data {
+			sizeStr := fmt.Sprintf("%d", fd.Size)
+			modStr := fd.Modified.Format("2006-01-02 15:04:05")
+			if fd.Modified.IsZero() {
+				modStr = "-"
+			}
+			fmt.Printf("  %-40s %-66s %10s %20s\n", filename, fd.Blake2b, sizeStr, modStr)
+		}
+		a.outputMu.Unlock()
+	}
+	return nil
+}
+
 // Update adds size/modification metadata to legacy .ghost files.
 func (a *App) Update(ctx context.Context, path string, recursive bool) error {
 	fi, err := os.Lstat(path)
@@ -864,7 +915,7 @@ func RunWorkers[T any](ctx context.Context, jobs []T, workerFunc func(context.Co
 				}
 				workerFunc(ctx, job)
 				cur := processed.Add(1)
-				if cur%progressUpdateFreq == 0 {
+				if cur%10 == 0 {
 					a.PrintProgress(cur, totalJobs, operationName)
 				}
 			}
