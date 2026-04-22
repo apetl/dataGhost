@@ -1,0 +1,99 @@
+// Package output provides terminal formatting, colors, and help text.
+package output
+
+import (
+	"fmt"
+	"os"
+	"strings"
+)
+
+// Color codes for terminal output -- only emitted when stdout is a TTY.
+var (
+	ColorReset   = ""
+	ColorRed     = ""
+	ColorGreen   = ""
+	ColorYellow  = ""
+	ColorBlue    = ""
+	ColorMagenta = ""
+	ColorCyan    = ""
+	ColorGray    = ""
+)
+
+// InitColors populates color variables when stdout is a terminal device.
+func InitColors() {
+	fi, err := os.Stdout.Stat()
+	if err == nil && (fi.Mode()&os.ModeCharDevice) != 0 {
+		ColorReset = "\033[0m"
+		ColorRed = "\033[31m"
+		ColorGreen = "\033[32m"
+		ColorYellow = "\033[33m"
+		ColorBlue = "\033[34m"
+		ColorMagenta = "\033[35m"
+		ColorCyan = "\033[36m"
+		ColorGray = "\033[90m"
+	}
+}
+
+// IsStdinInteractive returns true if stdin is a terminal device.
+func IsStdinInteractive() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+// BoxLine returns a single bordered line padded to exactly w inner characters.
+func BoxLine(w int, text string) string {
+	pad := w - len(text)
+	if pad < 0 {
+		pad = 0
+	}
+	lp := pad / 2
+	rp := pad - lp
+	return ColorBlue + "║" + ColorReset + strings.Repeat(" ", lp) + text + strings.Repeat(" ", rp) + ColorBlue + "║" + ColorReset + "\n"
+}
+
+// Help prints the usage banner and command reference.
+func Help() {
+	const w = 58 // inner width of the help box
+	top := ColorBlue + "╔" + strings.Repeat("═", w) + "╗" + ColorReset + "\n"
+	bot := ColorBlue + "╚" + strings.Repeat("═", w) + "╝" + ColorReset + "\n"
+	fmt.Print(
+		top +
+			BoxLine(w, "dataGhost v2.3") +
+			BoxLine(w, "File Integrity Tracking Utility") +
+			bot + "\n" +
+			ColorYellow + "USAGE:" + ColorReset + "\n" +
+			"  dataGhost [OPTIONS] COMMAND " + ColorGray + "[PATH]" + ColorReset + "\n\n" +
+			ColorYellow + "COMMANDS:" + ColorReset + "\n" +
+			"  " + ColorGreen + "add" + ColorReset + "       Add files to tracking\n" +
+			"  " + ColorRed + "del" + ColorReset + "       Remove files from tracking\n" +
+			"  " + ColorCyan + "check" + ColorReset + "     Verify file integrity\n" +
+			"  " + ColorYellow + "clean" + ColorReset + "     Remove missing file entries from tracking\n" +
+			"  " + ColorMagenta + "update" + ColorReset + "    Update old .ghost files with size/modification metadata\n\n" +
+			ColorYellow + "OPTIONS:" + ColorReset + "\n" +
+			"  " + ColorCyan + "-r" + ColorReset + "              Process directories recursively\n" +
+			"  " + ColorCyan + "-p" + ColorReset + " N            Set number of parallel workers (default: CPU count)\n" +
+			"  " + ColorCyan + "-f" + ColorReset + "              Force operations without prompts\n" +
+			"  " + ColorCyan + "-qc" + ColorReset + "             Quick check: skip rehash if size/modtime unchanged\n" +
+			"  " + ColorCyan + "-q" + ColorReset + "              Quiet mode\n" +
+			"  " + ColorCyan + "-c" + ColorReset + "              Load .ghostconf from target directory\n" +
+			"  " + ColorCyan + "-cf" + ColorReset + " " + ColorGray + "FILE" + ColorReset + "        Load config from a specific file\n" +
+			"  " + ColorCyan + "-cs" + ColorReset + "             Strict mode (no local overrides)\n" +
+			"  " + ColorCyan + "-csf" + ColorReset + " " + ColorGray + "FILE" + ColorReset + "       Load config from file (strict mode)\n\n" +
+			ColorYellow + "CONFIG FILE EXAMPLE " + ColorGray + "(.ghostconf)" + ColorReset + ":\n" +
+			"  " + ColorCyan + "ignore" + ColorReset + ":\n" +
+			"    - " + ColorGreen + "\"*.tmp\"" + ColorReset + "\n" +
+			"    - " + ColorGreen + "\"*.log\"" + ColorReset + "\n" +
+			"    - " + ColorGreen + "\"node_modules/\"" + ColorReset + "\n" +
+			"    - " + ColorGreen + "\".git/\"" + ColorReset + "\n" +
+			"  " + ColorCyan + "buffer" + ColorReset + ": " + ColorGreen + "262144" + ColorReset + "\n" +
+			"  " + ColorCyan + "parallel" + ColorReset + ": " + ColorGreen + "4" + ColorReset + "\n" +
+			"  " + ColorCyan + "show_progress" + ColorReset + ": " + ColorGreen + "true" + ColorReset + "\n\n" +
+			ColorYellow + "EXIT CODES:" + ColorReset + "\n" +
+			"  0  Success\n" +
+			"  1  Corruption detected / unexpected changes\n" +
+			"  2  Error occurred\n",
+	)
+}
