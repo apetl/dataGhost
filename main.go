@@ -132,7 +132,9 @@ type app struct {
 }
 
 func newApp() *app {
+	cfg := defaultConfig()
 	return &app{
+		cfg:         cfg,
 		startTime:   time.Now(),
 		configCache: newBoundedMap[conf](boundedMapCap),
 	}
@@ -162,6 +164,15 @@ func initColors() {
 		colorCyan = "\033[36m"
 		colorGray = "\033[90m"
 	}
+}
+
+// isStdinInteractive returns true if stdin is a terminal device.
+func isStdinInteractive() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
 const (
@@ -255,6 +266,9 @@ func loadConfigFromFile(configPath string) (conf, error) {
 	b, err := os.ReadFile(configPath)
 	if err != nil {
 		return cfg, fmt.Errorf("failed to read config file '%s': %w", configPath, err)
+	}
+	if len(b) == 0 {
+		return cfg, nil
 	}
 	if err := yaml.Unmarshal(b, &cfg); err != nil {
 		return cfg, fmt.Errorf("failed to parse config YAML from '%s': %w", configPath, err)
@@ -607,6 +621,10 @@ func (a *app) addF(ctx context.Context, filePath, ghostPath, basePath string) {
 		}
 	}
 	if shouldPrompt {
+		if !isStdinInteractive() {
+			a.logf("%s[WARNING]%s '%s' already tracked with a different hash. Skipping overwrite (stdin is not a terminal; use -f to force).\n", colorYellow, colorReset, promptFilename)
+			return
+		}
 		a.outputMu.Lock()
 		a.clearProgress()
 		fmt.Printf("%s[WARNING]%s '%s' already tracked with a different hash.\n", colorYellow, colorReset, promptFilename)
@@ -715,7 +733,7 @@ func (a *app) checkF(ctx context.Context, filePath, ghostPath, basePath string) 
 
 	a.stats.checked.Add(1)
 
-	st, err := os.Stat(filePath)
+	st, err := os.Lstat(filePath)
 	if err != nil {
 		a.stats.errors.Add(1)
 		a.logf("%s[ERROR]%s Failed to stat '%s': %v\n", colorRed, colorReset, filePath, err)
@@ -880,7 +898,7 @@ func (a *app) cleanGhostFile(ghostPath string) int64 {
 	}
 	removed := 0
 	for filename := range data {
-		if _, err := os.Stat(filepath.Join(dirPath, filename)); os.IsNotExist(err) {
+		if _, err := os.Lstat(filepath.Join(dirPath, filename)); os.IsNotExist(err) {
 			a.logf("%s[MISSING]%s Removing entry for %s\n", colorYellow, colorReset, filename)
 			delete(data, filename)
 			removed++
@@ -897,7 +915,7 @@ func (a *app) cleanGhostFile(ghostPath string) int64 {
 }
 
 func (a *app) clean(ctx context.Context, path string, recursive bool) error {
-	fi, err := os.Stat(path)
+	fi, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("failed to access path '%s': %w", path, err)
 	}
@@ -966,7 +984,7 @@ func (a *app) updateGhostFile(ctx context.Context, job updateWorkItem) {
 			continue
 		}
 		filePath := filepath.Join(job.dirPath, filename)
-		st, err := os.Stat(filePath)
+		st, err := os.Lstat(filePath)
 		if err != nil {
 			a.logf("%s[WARNING]%s Cannot stat '%s': %v\n", colorYellow, colorReset, filename, err)
 			continue
@@ -998,7 +1016,7 @@ func (a *app) updateGhostFile(ctx context.Context, job updateWorkItem) {
 }
 
 func (a *app) update(ctx context.Context, path string, recursive bool) error {
-	fi, err := os.Stat(path)
+	fi, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("failed to access path '%s': %w", path, err)
 	}
