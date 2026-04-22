@@ -210,8 +210,19 @@ func (a *App) getConfigForPath(dirPath string) config.Config {
 		return v
 	}
 	cfg := a.Config
-	if local, err := config.LoadConfigFromFile(filepath.Join(dirPath, ".ghostconf")); err == nil {
-		cfg.Ignore = local.Ignore
+	// Walk up the directory tree to find the nearest .ghostconf.
+	for dir := dirPath; ; dir = filepath.Dir(dir) {
+		ghostConfPath := filepath.Join(dir, ".ghostconf")
+		if _, err := os.Stat(ghostConfPath); err == nil {
+			if local, err := config.LoadConfigFromFile(ghostConfPath); err == nil {
+				cfg.Ignore = local.Ignore
+				break
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
 	}
 	return a.configCache.loadOrStore(dirPath, cfg)
 }
