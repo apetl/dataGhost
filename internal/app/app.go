@@ -3,6 +3,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -110,6 +111,8 @@ type App struct {
 	Config       config.Config
 	Strict       bool
 	AlwaysRehash bool
+	DryRun       bool
+	JSONOutput   bool
 	StartTime    time.Time
 	Stats        Stats
 
@@ -136,12 +139,23 @@ func (a *App) getGhostMutex(ghostPath string) *sync.Mutex {
 
 // Logf logs a formatted message unless quiet mode is enabled.
 func (a *App) Logf(format string, args ...any) {
-	if !a.Config.Quiet {
+	if !a.Config.Quiet && !a.JSONOutput {
 		a.outputMu.Lock()
 		a.clearProgress()
 		fmt.Printf(format, args...)
 		a.outputMu.Unlock()
 	}
+}
+
+// JSONLog emits a structured JSON event when JSON output mode is enabled.
+func (a *App) JSONLog(event map[string]any) {
+	if !a.JSONOutput {
+		return
+	}
+	a.outputMu.Lock()
+	defer a.outputMu.Unlock()
+	b, _ := json.Marshal(event)
+	fmt.Println(string(b))
 }
 
 // PrintProgress renders a progress line to the terminal.
@@ -318,6 +332,18 @@ func (a *App) AddF(ctx context.Context, filePath, ghostPath, basePath string) {
 	}
 
 	data[filename] = ghost.FileData{Blake2b: currentHash, Size: st.Size(), Modified: st.ModTime()}
+	if a.DryRun {
+		a.Logf("%s[DRY-RUN]%s Would write %s to %s\n", output.ColorYellow, output.ColorReset, filename, ghostPath)
+		a.JSONLog(map[string]any{
+			"event":      "dry_run",
+			"operation":  "add",
+			"file":       filename,
+			"ghost_path": ghostPath,
+			"hash":       currentHash,
+			"size":       st.Size(),
+		})
+		return
+	}
 	if err := ghost.WriteGhost(data, ghostPath); err != nil {
 		a.Logf("%s[ERROR]%s %v\n", output.ColorRed, output.ColorReset, err)
 		a.Stats.Errors.Add(1)
@@ -349,7 +375,16 @@ func (a *App) DelF(ctx context.Context, filePath, ghostPath, _ string) {
 	delete(data, filename)
 	a.Stats.Deleted.Add(1)
 	a.Logf("%s[DELETED]%s %s\n", output.ColorRed, output.ColorReset, filename)
+	a.JSONLog(map[string]any{
+		"event":      "deleted",
+		"file":       filename,
+		"ghost_path": ghostPath,
+	})
 
+	if a.DryRun {
+		a.Logf("%s[DRY-RUN]%s Would remove %s from %s\n", output.ColorYellow, output.ColorReset, filename, ghostPath)
+		return
+	}
 	if err := ghost.WriteGhost(data, ghostPath); err != nil {
 		a.Logf("%s[ERROR]%s %v\n", output.ColorRed, output.ColorReset, err)
 		a.Stats.Errors.Add(1)
@@ -550,6 +585,16 @@ func (a *App) cleanGhostFile(ghostPath string) int64 {
 		}
 	}
 	if removed > 0 {
+		if a.DryRun {
+			a.Logf("%s[DRY-RUN]%s Would clean %d missing entr(y/ies) from %s\n", output.ColorYellow, output.ColorReset, removed, ghostPath)
+			a.JSONLog(map[string]any{
+				"event":      "dry_run",
+				"operation":  "clean",
+				"ghost_path": ghostPath,
+				"removed":    removed,
+			})
+			return int64(removed)
+		}
 		if err := ghost.WriteGhost(data, ghostPath); err != nil {
 			a.Logf("%s[ERROR]%s Failed to write %s: %v\n", output.ColorRed, output.ColorReset, ghostPath, err)
 			a.Stats.Errors.Add(1)
@@ -652,6 +697,16 @@ func (a *App) updateGhostFile(ctx context.Context, job updateWorkItem) {
 	}
 
 	if updatedCount > 0 {
+		if a.DryRun {
+			a.Logf("%s[DRY-RUN]%s Would update %d metadata entr(y/ies) in %s\n", output.ColorYellow, output.ColorReset, updatedCount, job.ghostPath)
+			a.JSONLog(map[string]any{
+				"event":      "dry_run",
+				"operation":  "update",
+				"ghost_path": job.ghostPath,
+				"updated":    updatedCount,
+			})
+			return
+		}
 		if err := ghost.WriteGhost(data, job.ghostPath); err != nil {
 			a.Logf("%s[ERROR]%s Failed to write '%s': %v\n", output.ColorRed, output.ColorReset, job.ghostPath, err)
 			a.Stats.Errors.Add(1)
@@ -698,11 +753,28 @@ func (a *App) Update(ctx context.Context, path string, recursive bool) error {
 	return nil
 }
 
-// PrintSummary renders the final operation summary box.
+// PrintSummary renders the final operation summary box (or JSON when enabled).
 func (a *App) PrintSummary() {
 	elapsed := time.Since(a.StartTime).Round(time.Millisecond)
+	snapshot := a.Stats.Snapshot()
+
 	a.outputMu.Lock()
 	defer a.outputMu.Unlock()
+
+	if a.JSONOutput {
+		summary := map[string]any{
+			"event":    "summary",
+			"duration": elapsed.String(),
+			"stats":    snapshot,
+		}
+		if a.DryRun {
+			summary["dry_run"] = true
+		}
+		b, _ := json.Marshal(summary)
+		fmt.Println(string(b))
+		return
+	}
+
 	a.clearProgress()
 	fmt.Println()
 
@@ -731,31 +803,37 @@ func (a *App) PrintSummary() {
 		fmt.Printf("%s %s%*s%s %s\n", bar, label, pad, "", v, bar)
 	}
 
-	if v := a.Stats.Checked.Load(); v > 0 {
+	if a.DryRun {
+		fmt.Printf("%s%s%s\n", bar, strings.Repeat(" ", w), bar)
+		fmt.Printf("%s%s%s%s%s\n", bar, strings.Repeat(" ", (w-7)/2), "DRY RUN", strings.Repeat(" ", (w-7)/2), bar)
+		fmt.Printf("%s%s%s\n", bar, strings.Repeat(" ", w), bar)
+	}
+
+	if v := snapshot["checked"]; v > 0 {
 		line("Checked:", fmt.Sprintf("%d", v), output.ColorCyan)
 	}
-	if v := a.Stats.OK.Load(); v > 0 {
+	if v := snapshot["ok"]; v > 0 {
 		line("OK:", fmt.Sprintf("%d", v), output.ColorGreen)
 	}
-	if v := a.Stats.Corrupted.Load(); v > 0 {
+	if v := snapshot["corrupted"]; v > 0 {
 		line("Corrupted:", fmt.Sprintf("%d", v), output.ColorRed)
 	}
-	if v := a.Stats.Added.Load(); v > 0 {
+	if v := snapshot["added"]; v > 0 {
 		line("Added:", fmt.Sprintf("%d", v), output.ColorGreen)
 	}
-	if v := a.Stats.Modified.Load(); v > 0 {
+	if v := snapshot["modified"]; v > 0 {
 		line("Modified:", fmt.Sprintf("%d", v), output.ColorBlue)
 	}
-	if v := a.Stats.Updated.Load(); v > 0 {
+	if v := snapshot["updated"]; v > 0 {
 		line("Updated:", fmt.Sprintf("%d", v), output.ColorGreen)
 	}
-	if v := a.Stats.Deleted.Load(); v > 0 {
+	if v := snapshot["deleted"]; v > 0 {
 		line("Deleted:", fmt.Sprintf("%d", v), output.ColorRed)
 	}
-	if v := a.Stats.Skipped.Load(); v > 0 {
+	if v := snapshot["skipped"]; v > 0 {
 		line("Skipped:", fmt.Sprintf("%d", v), output.ColorYellow)
 	}
-	if v := a.Stats.Errors.Load(); v > 0 {
+	if v := snapshot["errors"]; v > 0 {
 		line("Errors:", fmt.Sprintf("%d", v), output.ColorRed)
 	}
 	line("Duration:", elapsed.String(), "")

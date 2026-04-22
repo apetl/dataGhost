@@ -11,6 +11,18 @@ import (
 	"github.com/goccy/go-yaml"
 )
 
+// StringSlice is a flag.Value that accumulates multiple string flags.
+type StringSlice []string
+
+func (s *StringSlice) String() string {
+	return strings.Join(*s, ", ")
+}
+
+func (s *StringSlice) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
+
 // Config represents configuration settings from a .ghostconf file.
 type Config struct {
 	Ignore       []string `yaml:"ignore"`
@@ -53,7 +65,18 @@ func LoadConfigFromFile(configPath string) (Config, error) {
 	if cfg.Buffer < 0 {
 		return cfg, fmt.Errorf("invalid buffer value %d in '%s': must be >= 0", cfg.Buffer, configPath)
 	}
+	if err := ValidateConfig(cfg, configPath); err != nil {
+		return cfg, err
+	}
 	return cfg, nil
+}
+
+// ValidateConfig checks a Config for invalid values and returns an error if any are found.
+func ValidateConfig(cfg Config, source string) error {
+	if cfg.Parallel < 1 {
+		return fmt.Errorf("invalid parallel value %d in '%s': must be >= 1", cfg.Parallel, source)
+	}
+	return nil
 }
 
 // IsIgnoredWithConfig checks ignore patterns using a pre-resolved config,

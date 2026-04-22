@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"dataGhost/internal/app"
+	"dataGhost/internal/config"
 	"dataGhost/internal/output"
 )
 
@@ -36,6 +37,9 @@ func main() {
 		recursive        bool
 		forceOverwrite   bool
 		quickCheck       bool
+		dryRun           bool
+		jsonOutput       bool
+		ignorePatterns   config.StringSlice
 	)
 	flag.BoolVar(&useConfig, "c", false, "Load .ghostconf from target directory")
 	flag.BoolVar(&useStrictConfig, "cs", false, "Load .ghostconf (strict mode)")
@@ -46,17 +50,39 @@ func main() {
 	flag.BoolVar(&recursive, "r", false, "Process recursively")
 	flag.BoolVar(&forceOverwrite, "f", false, "Force operations")
 	flag.BoolVar(&quickCheck, "qc", false, "Quick check")
+	flag.BoolVar(&dryRun, "d", false, "Dry run: show what would happen without writing")
+	flag.BoolVar(&jsonOutput, "json", false, "Output results as JSON lines")
+	flag.Var(&ignorePatterns, "i", "Ignore pattern (can be used multiple times)")
 	flag.Parse()
+
+	if flag.NArg() < 1 {
+		output.Help()
+		os.Exit(2)
+	}
+	command := flag.Arg(0)
+
+	// Handle version command specially (no path required).
+	if command == "version" {
+		fmt.Printf("dataGhost %s\n", output.AppVersion)
+		os.Exit(0)
+	}
 
 	if flag.NArg() < 2 {
 		output.Help()
 		os.Exit(2)
 	}
-	command := flag.Arg(0)
 	path := flag.Arg(1)
 
 	a := app.NewApp()
 	a.AlwaysRehash = !isFlagSet("qc")
+	a.DryRun = dryRun
+	a.JSONOutput = jsonOutput
+
+	// JSON mode implies quiet for terminal output.
+	if a.JSONOutput {
+		a.Config.Quiet = true
+		a.Config.ShowProgress = false
+	}
 
 	useAnyConfig := useConfig || useStrictConfig || configFile != "" || strictConfigFile != ""
 	isStrict := useStrictConfig || strictConfigFile != ""
@@ -68,6 +94,11 @@ func main() {
 	if err := a.LoadConfig(finalCF, path, useAnyConfig, isStrict); err != nil {
 		fmt.Printf("%s[FATAL]%s Failed to load config: %v\n", output.ColorRed, output.ColorReset, err)
 		os.Exit(2)
+	}
+
+	// Apply CLI ignore patterns after config is loaded.
+	if len(ignorePatterns) > 0 {
+		a.Config.Ignore = append(a.Config.Ignore, ignorePatterns...)
 	}
 
 	if isFlagSet("p") {
@@ -100,7 +131,11 @@ func main() {
 			func(ctx context.Context, fp, gp, bp string) { a.DelF(ctx, fp, gp, bp) }, "delete")
 	case "check":
 		if !a.AlwaysRehash {
-			fmt.Printf("%s[WARNING]%s Quick check mode: does NOT detect bit rot.\n", output.ColorYellow, output.ColorReset)
+			if a.JSONOutput {
+				a.JSONLog(map[string]any{"event": "warning", "message": "Quick check mode: does NOT detect bit rot."})
+			} else {
+				fmt.Printf("%s[WARNING]%s Quick check mode: does NOT detect bit rot.\n", output.ColorYellow, output.ColorReset)
+			}
 		}
 		opErr = a.ProcessFiles(ctx, path, recursive,
 			func(ctx context.Context, fp, gp, bp string) { a.CheckF(ctx, fp, gp, bp) }, "check")
@@ -115,15 +150,23 @@ func main() {
 	}
 
 	if ctx.Err() != nil {
-		fmt.Printf("\n%s[INTERRUPTED]%s Operation cancelled.\n", output.ColorYellow, output.ColorReset)
+		if a.JSONOutput {
+			a.JSONLog(map[string]any{"event": "interrupted", "message": "Operation cancelled."})
+		} else {
+			fmt.Printf("\n%s[INTERRUPTED]%s Operation cancelled.\n", output.ColorYellow, output.ColorReset)
+		}
 	}
 
 	if opErr != nil {
-		fmt.Printf("%s[FATAL]%s %v\n", output.ColorRed, output.ColorReset, opErr)
+		if a.JSONOutput {
+			a.JSONLog(map[string]any{"event": "fatal", "error": opErr.Error()})
+		} else {
+			fmt.Printf("%s[FATAL]%s %v\n", output.ColorRed, output.ColorReset, opErr)
+		}
 		os.Exit(2)
 	}
 
-	if !a.Config.Quiet {
+	if !a.Config.Quiet || a.JSONOutput {
 		a.PrintSummary()
 	}
 

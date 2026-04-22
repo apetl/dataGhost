@@ -7,6 +7,9 @@ import (
 	"strings"
 )
 
+// AppVersion is the current dataGhost version.
+const AppVersion = "v2.4"
+
 // Color codes for terminal output -- only emitted when stdout is a TTY.
 var (
 	ColorReset   = ""
@@ -61,7 +64,7 @@ func Help() {
 	bot := ColorBlue + "╚" + strings.Repeat("═", w) + "╝" + ColorReset + "\n"
 	fmt.Print(
 		top +
-			BoxLine(w, "dataGhost v2.3") +
+			BoxLine(w, "dataGhost "+AppVersion) +
 			BoxLine(w, "File Integrity Tracking Utility") +
 			bot + "\n" +
 			ColorYellow + "USAGE:" + ColorReset + "\n" +
@@ -71,13 +74,17 @@ func Help() {
 			"  " + ColorRed + "del" + ColorReset + "       Remove files from tracking\n" +
 			"  " + ColorCyan + "check" + ColorReset + "     Verify file integrity\n" +
 			"  " + ColorYellow + "clean" + ColorReset + "     Remove missing file entries from tracking\n" +
-			"  " + ColorMagenta + "update" + ColorReset + "    Update old .ghost files with size/modification metadata\n\n" +
+			"  " + ColorMagenta + "update" + ColorReset + "    Update old .ghost files with size/modification metadata\n" +
+			"  " + ColorBlue + "version" + ColorReset + "   Print version information\n\n" +
 			ColorYellow + "OPTIONS:" + ColorReset + "\n" +
 			"  " + ColorCyan + "-r" + ColorReset + "              Process directories recursively\n" +
 			"  " + ColorCyan + "-p" + ColorReset + " N            Set number of parallel workers (default: CPU count)\n" +
 			"  " + ColorCyan + "-f" + ColorReset + "              Force operations without prompts\n" +
+			"  " + ColorCyan + "-d" + ColorReset + "              Dry run: show what would happen without writing\n" +
 			"  " + ColorCyan + "-qc" + ColorReset + "             Quick check: skip rehash if size/modtime unchanged\n" +
 			"  " + ColorCyan + "-q" + ColorReset + "              Quiet mode\n" +
+			"  " + ColorCyan + "--json" + ColorReset + "          Output results as JSON lines\n" +
+			"  " + ColorCyan + "-i" + ColorReset + " PATTERN      Ignore pattern (can be used multiple times)\n" +
 			"  " + ColorCyan + "-c" + ColorReset + "              Load .ghostconf from target directory\n" +
 			"  " + ColorCyan + "-cf" + ColorReset + " " + ColorGray + "FILE" + ColorReset + "        Load config from a specific file\n" +
 			"  " + ColorCyan + "-cs" + ColorReset + "             Strict mode (no local overrides)\n" +
