@@ -32,7 +32,6 @@ release:
   gitea:
     owner: apetl
     name: dataGhost
-    token: "{{ .Env.RELEASE_GITEA_TOKEN }}"
   draft: true
   prerelease: auto
   name_template: '{{ .Date.Format "2006-01-02" }} ({{ .ShortCommit }})'
