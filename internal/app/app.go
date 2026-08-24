@@ -1,3 +1,8 @@
+// Copyright (c) 2026 apetl.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // Package app implements the core dataGhost operations, worker pools, and app state.
 package app
 
@@ -38,23 +43,27 @@ type Stats struct {
 	Modified  atomic.Int64
 	Updated   atomic.Int64
 	Missing   atomic.Int64
+	Untracked atomic.Int64
+	ModeDrift atomic.Int64
 	Bytes     atomic.Int64
 }
 
 // Snapshot returns a read-only snapshot of all statistics.
 func (s *Stats) Snapshot() map[string]int64 {
 	return map[string]int64{
-		"checked":   s.Checked.Load(),
-		"corrupted": s.Corrupted.Load(),
-		"ok":        s.OK.Load(),
-		"errors":    s.Errors.Load(),
-		"skipped":   s.Skipped.Load(),
-		"added":     s.Added.Load(),
-		"deleted":   s.Deleted.Load(),
-		"modified":  s.Modified.Load(),
-		"updated":   s.Updated.Load(),
-		"missing":   s.Missing.Load(),
-		"bytes":     s.Bytes.Load(),
+		"checked":    s.Checked.Load(),
+		"corrupted":  s.Corrupted.Load(),
+		"ok":         s.OK.Load(),
+		"errors":     s.Errors.Load(),
+		"skipped":    s.Skipped.Load(),
+		"added":      s.Added.Load(),
+		"deleted":    s.Deleted.Load(),
+		"modified":   s.Modified.Load(),
+		"updated":    s.Updated.Load(),
+		"missing":    s.Missing.Load(),
+		"untracked":  s.Untracked.Load(),
+		"mode_drift": s.ModeDrift.Load(),
+		"bytes":      s.Bytes.Load(),
 	}
 }
 
@@ -310,12 +319,27 @@ func (a *App) clearProgress() {
 // ── config ───────────────────────────────────────────────────────────────────
 
 // LoadConfig resolves the effective configuration for the target path.
+// Layering (low to high priority): built-in defaults, the user-level global
+// config (GlobalConfigPath), then the explicit local config (-c/-cf). Keys
+// absent from a higher layer keep the value set by the layer below.
 func (a *App) LoadConfig(configFile, targetPath string, useConfig, useStrict bool) error {
 	a.Config = config.DefaultConfig()
 	a.Strict = useStrict
+
+	// Layer 1: user-level global config, applied to every run. Absence is
+	// normal; a parse/validation error is reported because it affects every
+	// invocation.
+	if gp, err := config.GlobalConfigPath(); err == nil {
+		if gerr := config.LoadConfigInto(&a.Config, gp); gerr != nil {
+			return fmt.Errorf("global config %s: %w", gp, gerr)
+		}
+	}
+
 	if !useConfig {
 		return nil
 	}
+
+	// Layer 2: explicit local config, overriding the global values.
 	configPath := configFile
 	if configPath == "" {
 		abs, err := filepath.Abs(targetPath)
@@ -332,9 +356,7 @@ func (a *App) LoadConfig(configFile, targetPath string, useConfig, useStrict boo
 		}
 		configPath = filepath.Join(root, ".ghostconf")
 	}
-	var err error
-	a.Config, err = config.LoadConfigFromFile(configPath)
-	return err
+	return config.LoadConfigInto(&a.Config, configPath)
 }
 
 // getConfigForPath returns the effective config for a directory.
@@ -465,7 +487,11 @@ func (a *App) AddF(ctx context.Context, filePath, ghostPath, basePath string) {
 		a.Logt(output.TagAdded, "%s\n", filename)
 	}
 
-	gs.data[filename] = ghost.FileData{Blake2b: currentHash, Size: st.Size(), Modified: st.ModTime()}
+	fd := ghost.FileData{Blake2b: currentHash, Size: st.Size(), Modified: st.ModTime()}
+	if a.Config.TrackMode {
+		fd.Mode = fmt.Sprintf("%04o", st.Mode().Perm())
+	}
+	gs.data[filename] = fd
 	if a.DryRun {
 		a.Logt(output.TagDryRun, "Would write %s to %s\n", filename, ghostPath)
 		a.JSONLog(map[string]any{
@@ -541,7 +567,13 @@ func (a *App) CheckF(ctx context.Context, filePath, ghostPath, basePath string) 
 	gs.mu.Unlock()
 
 	if !exists {
+		a.Stats.Untracked.Add(1)
 		a.Logt(output.TagNotTracked, "%s\n", filename)
+		a.JSONLog(map[string]any{
+			"event":      "untracked",
+			"file":       filename,
+			"ghost_path": ghostPath,
+		})
 		return
 	}
 
@@ -552,6 +584,23 @@ func (a *App) CheckF(ctx context.Context, filePath, ghostPath, basePath string) 
 		a.Stats.Errors.Add(1)
 		a.Logt(output.TagError, "Failed to stat '%s': %v\n", filePath, err)
 		return
+	}
+
+	// Mode drift is a non-corrupting caution: permission bits changed without
+	// the content changing (e.g. an executable bit silently dropped). Checked
+	// in both quick and full modes so a chmod that preserves mtime is caught.
+	if a.Config.TrackMode && stored.Mode != "" {
+		if curMode := fmt.Sprintf("%04o", st.Mode().Perm()); curMode != stored.Mode {
+			a.Stats.ModeDrift.Add(1)
+			a.Logt(output.TagModeDrift, "%s %s -> %s\n", filename, stored.Mode, curMode)
+			a.JSONLog(map[string]any{
+				"event":        "mode_drift",
+				"file":         filename,
+				"ghost_path":   ghostPath,
+				"stored_mode":  stored.Mode,
+				"current_mode": curMode,
+			})
+		}
 	}
 
 	if !a.AlwaysRehash && !ghost.NeedsRehash(st, stored) {
@@ -586,7 +635,7 @@ func (a *App) CheckF(ctx context.Context, filePath, ghostPath, basePath string) 
 	// read-only media (flush failure is logged at debug, not fatal).
 	if !a.AlwaysRehash && ghost.NeedsRehash(st, stored) && !a.DryRun {
 		gs.mu.Lock()
-		gs.data[filename] = ghost.FileData{Blake2b: stored.Blake2b, Size: st.Size(), Modified: st.ModTime()}
+		gs.data[filename] = ghost.FileData{Blake2b: stored.Blake2b, Size: st.Size(), Modified: st.ModTime(), Mode: stored.Mode}
 		gs.metaDirty = true
 		gs.mu.Unlock()
 		a.Logt(output.TagRefresh, "%s metadata refreshed\n", filename)
@@ -1033,6 +1082,41 @@ func (a *App) ListGhosts(path string, recursive bool) error {
 	}
 	sort.Strings(ghostPaths)
 
+	// JSON mode: emit structured events instead of the formatted table.
+	if a.JSONOutput {
+		for _, gp := range ghostPaths {
+			data, err := ghost.ReadGhost(gp)
+			if err != nil {
+				a.JSONLog(map[string]any{"event": "error", "ghost_path": gp, "error": err.Error()})
+				continue
+			}
+			a.JSONLog(map[string]any{"event": "ghost_file", "path": gp, "entries": len(data)})
+			names := make([]string, 0, len(data))
+			for name := range data {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				fd := data[name]
+				ev := map[string]any{
+					"event":      "tracked_file",
+					"ghost_path": gp,
+					"file":       name,
+					"hash":       fd.Blake2b,
+					"size":       fd.Size,
+				}
+				if !fd.Modified.IsZero() {
+					ev["modified"] = fd.Modified.Format(time.RFC3339Nano)
+				}
+				if fd.Mode != "" {
+					ev["mode"] = fd.Mode
+				}
+				a.JSONLog(ev)
+			}
+		}
+		return nil
+	}
+
 	for _, gp := range ghostPaths {
 		data, err := ghost.ReadGhost(gp)
 		if err != nil {
@@ -1187,6 +1271,8 @@ func (a *App) PrintSummary(opName string, interrupted bool) {
 		add("ok", "ok")
 		add("corrupted", "corrupted")
 		add("missing", "missing")
+		add("untracked", "untracked")
+		add("mode_drift", "mode_drift")
 		add("added", "added")
 		add("modified", "modified")
 		add("updated", "updated")
@@ -1278,6 +1364,12 @@ func (a *App) PrintSummary(opName string, interrupted bool) {
 	}
 	if n := snapshot["missing"]; n > 0 {
 		line("Missing:", fmt.Sprintf("%d", n), output.CYellow)
+	}
+	if n := snapshot["untracked"]; n > 0 {
+		line("Untracked:", fmt.Sprintf("%d", n), output.CYellow)
+	}
+	if n := snapshot["mode_drift"]; n > 0 {
+		line("Mode drift:", fmt.Sprintf("%d", n), output.CMagenta)
 	}
 	if n := snapshot["added"]; n > 0 {
 		line("Added:", fmt.Sprintf("%d", n), output.CGreen)

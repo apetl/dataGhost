@@ -1,3 +1,8 @@
+// Copyright (c) 2026 apetl.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 package main
 
 import (
@@ -130,7 +135,11 @@ func main() {
 	// Commands that do not require a path argument.
 	switch command {
 	case "version":
-		fmt.Printf("dataGhost %s\n", output.AppVersion)
+		if jsonOutput {
+			fmt.Printf("{\"event\":\"version\",\"version\":%q}\n", output.AppVersion)
+		} else {
+			fmt.Printf("dataGhost %s\n", output.AppVersion)
+		}
 		os.Exit(0)
 	case "help":
 		output.Help()
@@ -283,6 +292,9 @@ func main() {
 		exitCode = 1
 	}
 	if a.Stats.Missing.Load() > 0 && command == "check" {
+		exitCode = 1
+	}
+	if a.Stats.Untracked.Load() > 0 && command == "check" && a.Config.FailUntracked {
 		exitCode = 1
 	}
 	if a.Stats.Modified.Load() > 0 && command == "add" {

@@ -482,3 +482,119 @@ func TestCheckQuickCheckMetadataSelfHeals(t *testing.T) {
 		t.Errorf("second check bytes = %d, want 0 (should be cached)", a2.Stats.Bytes.Load())
 	}
 }
+
+// TestModeDrift verifies that check reports a permission-bit change as mode
+// drift (a non-corrupting caution) when track_mode is enabled, even when the
+// quick-check cached path would otherwise skip the file.
+func TestModeDrift(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode drift detection relies on POSIX permission bits")
+	}
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "secret.txt")
+	if err := os.WriteFile(filePath, []byte("unchanged"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ghostPath := filepath.Join(tmpDir, ".ghost")
+
+	add := NewApp()
+	add.Config.Force = true
+	add.Config.Quiet = true
+	add.Config.Parallel = 1
+	add.Config.TrackMode = true
+	ctx := context.Background()
+	add.AddF(ctx, filePath, ghostPath, tmpDir)
+	add.flushGhosts()
+
+	stored, _ := ghost.ReadGhost(ghostPath)
+	if stored["secret.txt"].Mode != "0644" {
+		t.Fatalf("stored mode = %q, want \"0644\"", stored["secret.txt"].Mode)
+	}
+
+	if err := os.Chmod(filePath, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewApp()
+	a.Config.Quiet = true
+	a.Config.Parallel = 1
+	a.Config.TrackMode = true
+	a.AlwaysRehash = false // -qc: size/modtime unchanged, mode drift must still fire
+	if err := a.ProcessFiles(ctx, tmpDir, false,
+		func(ctx context.Context, fp, gp, bp string) { a.CheckF(ctx, fp, gp, bp) }, "check"); err != nil {
+		t.Fatalf("check error: %v", err)
+	}
+	if got := a.Stats.ModeDrift.Load(); got != 1 {
+		t.Errorf("mode drift = %d, want 1", got)
+	}
+	if got := a.Stats.OK.Load(); got != 1 {
+		t.Errorf("ok = %d, want 1", got)
+	}
+	if got := a.Stats.Corrupted.Load(); got != 0 {
+		t.Errorf("corrupted = %d, want 0", got)
+	}
+	if got := a.Stats.Bytes.Load(); got != 0 {
+		t.Errorf("bytes = %d, want 0 (should be cached, not rehashed)", got)
+	}
+}
+
+// TestUntrackedCount verifies that a directory check counts on-disk files
+// that have no ghost entry as untracked.
+func TestUntrackedCount(t *testing.T) {
+	tmpDir := t.TempDir()
+	tracked := filepath.Join(tmpDir, "tracked.txt")
+	untracked := filepath.Join(tmpDir, "extra.txt")
+	if err := os.WriteFile(tracked, []byte("known"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(untracked, []byte("surprise"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	hashStr, err := hash.CalcHash(tracked, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghostPath := filepath.Join(tmpDir, ".ghost")
+	if err := ghost.WriteGhost(map[string]ghost.FileData{
+		"tracked.txt": {Blake2b: hashStr, Size: 5},
+	}, ghostPath); err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewApp()
+	a.Config.Quiet = true
+	a.Config.Parallel = 1
+	a.AlwaysRehash = true
+	ctx := context.Background()
+	if err := a.ProcessFiles(ctx, tmpDir, false,
+		func(ctx context.Context, fp, gp, bp string) { a.CheckF(ctx, fp, gp, bp) }, "check"); err != nil {
+		t.Fatalf("check error: %v", err)
+	}
+	if got := a.Stats.Untracked.Load(); got != 1 {
+		t.Errorf("untracked = %d, want 1", got)
+	}
+	if got := a.Stats.OK.Load(); got != 1 {
+		t.Errorf("ok = %d, want 1", got)
+	}
+	if got := a.Stats.Missing.Load(); got != 0 {
+		t.Errorf("missing = %d, want 0", got)
+	}
+}
+
+// TestGlobalConfigLayering verifies that a global config.yaml discovered via
+// DG_CONFIG_HOME is layered over the defaults even when no local config is used.
+func TestGlobalConfigLayering(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("DG_CONFIG_HOME", tmpDir)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte("parallel: 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewApp()
+	if err := a.LoadConfig("", tmpDir, false, false); err != nil {
+		t.Fatalf("LoadConfig error: %v", err)
+	}
+	if a.Config.Parallel != 2 {
+		t.Errorf("parallel = %d, want 2 (global config not layered)", a.Config.Parallel)
+	}
+}

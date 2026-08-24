@@ -1,17 +1,21 @@
+// Copyright (c) 2026 apetl.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // Package hash provides BLAKE2b hashing with memory-mapped and buffered strategies.
 package hash
 
 import (
+	"encoding/hex"
 	"fmt"
 	"hash"
 	"io"
 	"os"
 	"sync"
 
-	"github.com/edsrzf/mmap-go"
 	"golang.org/x/crypto/blake2b"
-
-	"dataGhost/internal/output"
+	"golang.org/x/exp/mmap"
 )
 
 const (
@@ -55,29 +59,29 @@ func GetBufferSize(fileSize int64, cfgBuffer int) int {
 }
 
 // CalcHashMmap computes the BLAKE2b-256 hash of a file using memory mapping.
+// It routes through HashPool and the shared buffer pool, and encodes the
+// digest with hex.EncodeToString (faster and leaner than fmt.Sprintf("%x")).
 func CalcHashMmap(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	data, err := mmap.Map(f, mmap.RDONLY, 0)
+	r, err := mmap.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("failed to mmap file: %w", err)
 	}
-	defer func() {
-		if err := data.Unmap(); err != nil {
-			fmt.Fprintf(os.Stderr, "%s[WARNING]%s Failed to unmap '%s': %v\n", output.ColorYellow, output.ColorReset, path, err)
-		}
-	}()
+	defer r.Close()
 
-	h, err := blake2b.New256(nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create hasher: %w", err)
+	h := HashPool.Get().(hash.Hash)
+	h.Reset()
+	defer HashPool.Put(h)
+
+	bufPtr := BufferPool.Get().(*[]byte)
+	buf := *bufPtr
+	section := io.NewSectionReader(r, 0, int64(r.Len()))
+	if _, err := io.CopyBuffer(h, section, buf); err != nil {
+		return "", fmt.Errorf("failed to read mmap'd file '%s': %w", path, err)
 	}
-	h.Write(data)
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	if cap(buf) <= DefaultBuffer {
+		BufferPool.Put(bufPtr)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // CalcHash computes the BLAKE2b-256 hash of a file, using mmap for large files
@@ -126,7 +130,7 @@ func CalcHash(path string, cfgBuffer int) (string, error) {
 		HashPool.Put(h)
 		return "", fmt.Errorf("failed to read file '%s': %w", path, copyErr)
 	}
-	hashStr := fmt.Sprintf("%x", h.Sum(nil))
+	hashStr := hex.EncodeToString(h.Sum(nil))
 	HashPool.Put(h)
 	return hashStr, nil
 }

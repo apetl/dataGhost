@@ -1,3 +1,8 @@
+// Copyright (c) 2026 apetl.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // Package output provides terminal formatting, colors, progress bars, and help text.
 package output
 
@@ -244,6 +249,7 @@ var (
 	TagWarning      = TagSpec{"WARNING", CYellow, LevelAlways}
 	TagMissing      = TagSpec{"MISSING", CYellow, LevelAlways}
 	TagNotTracked   = TagSpec{"NOT TRACKED", CYellow, LevelAlways}
+	TagModeDrift    = TagSpec{"MODE DRIFT", CMagenta, LevelAlways}
 	TagNotFound     = TagSpec{"NOT FOUND", CYellow, LevelAlways}
 	TagCancelled    = TagSpec{"CANCELLED", CYellow, LevelAlways}
 	TagDryRun       = TagSpec{"DRY-RUN", CYellow, LevelAlways}

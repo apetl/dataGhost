@@ -56,6 +56,45 @@ func TestCalcHash(t *testing.T) {
 	}
 }
 
+func TestCalcHashMmap(t *testing.T) {
+	// A file above the mmap threshold exercises the memory-mapped path,
+	// which swaps in golang.org/x/exp/mmap and routes through HashPool.
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "big.bin")
+	size := MmapThreshold + 1*1024*1024 // 11 MiB -> mmap path
+	chunk := []byte("0123456789ABCDEF")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	hExp, _ := blake2b.New256(nil)
+	buf := make([]byte, 64*1024)
+	for i := int64(0); i < int64(size); i += int64(len(buf)) {
+		n := int64(len(buf))
+		if i+n > int64(size) {
+			n = int64(size) - i
+		}
+		for j := int64(0); j < n; j += int64(len(chunk)) {
+			c := int64(len(chunk))
+			if j+c > n {
+				c = n - j
+			}
+			f.Write(chunk[:c])
+			hExp.Write(chunk[:c])
+		}
+	}
+	f.Close()
+	want := fmt.Sprintf("%x", hExp.Sum(nil))
+
+	got, err := CalcHash(path, 0)
+	if err != nil {
+		t.Fatalf("CalcHash error: %v", err)
+	}
+	if got != want {
+		t.Errorf("mmap path hash mismatch:\n got %s\nwant %s", got, want)
+	}
+}
+
 func TestCalcHashSymlink(t *testing.T) {
 	tmpDir := t.TempDir()
 	target := filepath.Join(tmpDir, "target.txt")

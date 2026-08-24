@@ -12,6 +12,6 @@ require (
 require github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
 
 require (
-	github.com/edsrzf/mmap-go v1.2.0
+	golang.org/x/exp v0.0.0-20260824195058-e88cd73687aa
 	golang.org/x/sys v0.47.0
 )
