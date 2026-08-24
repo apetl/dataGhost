@@ -6,9 +6,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"dataGhost/internal/ghost"
 	"dataGhost/internal/hash"
+	"dataGhost/internal/output"
 )
 
 func TestNewApp(t *testing.T) {
@@ -250,5 +252,233 @@ func TestEndToEndDelete(t *testing.T) {
 	}
 	if _, ok := readBack["delete.txt"]; ok {
 		t.Error("delete.txt should have been removed")
+	}
+}
+
+// TestCheckReportsMissing verifies that a directory check reports ghost entries
+// whose files have vanished from disk, while ignored entries are not reported.
+func TestCheckReportsMissing(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "keep.txt")
+
+	if err := os.WriteFile(filePath, []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	hashStr, err := hash.CalcHash(filePath, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ghostPath := filepath.Join(tmpDir, ".ghost")
+	data := map[string]ghost.FileData{
+		"keep.txt": {Blake2b: hashStr},
+		"gone.txt": {Blake2b: "def"}, // deleted from disk: must be reported
+		"gone.log": {Blake2b: "ghi"}, // deleted but ignored: must NOT be reported
+	}
+	if err := ghost.WriteGhost(data, ghostPath); err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewApp()
+	a.Config.Quiet = true
+	a.Config.Parallel = 1
+	a.AlwaysRehash = true
+	a.Config.Ignore = []string{"*.log"}
+
+	ctx := context.Background()
+	if err := a.ProcessFiles(ctx, tmpDir, false,
+		func(ctx context.Context, fp, gp, bp string) { a.CheckF(ctx, fp, gp, bp) }, "check"); err != nil {
+		t.Fatalf("check error: %v", err)
+	}
+
+	if got := a.Stats.OK.Load(); got != 1 {
+		t.Errorf("ok count = %d, want 1", got)
+	}
+	if got := a.Stats.Missing.Load(); got != 1 {
+		t.Errorf("missing count = %d, want 1 (gone.txt only; gone.log is ignored)", got)
+	}
+}
+
+// TestCheckSingleFileNoMissing verifies the documented contract that checking a
+// single file never reports other ghost entries as missing.
+func TestCheckSingleFileNoMissing(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "one.txt")
+	ghostPath := filepath.Join(tmpDir, ".ghost")
+
+	if err := os.WriteFile(filePath, []byte("one"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	data := map[string]ghost.FileData{
+		"one.txt": {Blake2b: "abc"},
+		"two.txt": {Blake2b: "def"},
+	}
+	if err := ghost.WriteGhost(data, ghostPath); err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewApp()
+	a.Config.Quiet = true
+	a.Config.Parallel = 1
+
+	ctx := context.Background()
+	if err := a.ProcessFiles(ctx, filePath, false,
+		func(ctx context.Context, fp, gp, bp string) { a.CheckF(ctx, fp, gp, bp) }, "check"); err != nil {
+		t.Fatalf("check error: %v", err)
+	}
+	if got := a.Stats.Missing.Load(); got != 0 {
+		t.Errorf("missing count = %d, want 0 for single-file check", got)
+	}
+}
+
+// TestShouldLogVerbosity verifies the verbosity/quiet/JSON gating of tagged logs.
+func TestShouldLogVerbosity(t *testing.T) {
+	a := NewApp()
+
+	if !a.shouldLog(output.TagError) {
+		t.Error("LevelAlways tag should log at verbosity 0")
+	}
+	if a.shouldLog(output.TagOK) {
+		t.Error("LevelVerbose tag should not log at verbosity 0")
+	}
+	a.Verbosity = 1
+	if !a.shouldLog(output.TagOK) {
+		t.Error("LevelVerbose tag should log at verbosity 1")
+	}
+	if a.shouldLog(output.TagSkip) {
+		t.Error("LevelDebug tag should not log at verbosity 1")
+	}
+	a.Verbosity = 2
+	if !a.shouldLog(output.TagSkip) {
+		t.Error("LevelDebug tag should log at verbosity 2")
+	}
+	a.Config.Quiet = true
+	if a.shouldLog(output.TagError) {
+		t.Error("quiet mode should suppress all tagged logs")
+	}
+	a.Config.Quiet = false
+	a.JSONOutput = true
+	if a.shouldLog(output.TagError) {
+		t.Error("JSON mode should suppress tagged logs")
+	}
+}
+
+// TestGhostBatching proves the per-ghost write-back cache: two AddF calls
+// mutate the in-memory cache only; the on-disk .ghost stays untouched until
+// flushGhosts runs, after which both entries materialize in a single write.
+func TestGhostBatching(t *testing.T) {
+	tmpDir := t.TempDir()
+	f1 := filepath.Join(tmpDir, "a.txt")
+	f2 := filepath.Join(tmpDir, "b.txt")
+	if err := os.WriteFile(f1, []byte("a"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f2, []byte("b"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ghostPath := filepath.Join(tmpDir, ".ghost")
+
+	a := NewApp()
+	a.Config.Force = true
+	a.Config.Quiet = true
+	a.Config.Parallel = 1
+
+	ctx := context.Background()
+	a.AddF(ctx, f1, ghostPath, tmpDir)
+	a.AddF(ctx, f2, ghostPath, tmpDir)
+
+	// Before flush, nothing should have hit disk.
+	if data, err := ghost.ReadGhost(ghostPath); err != nil {
+		t.Fatalf("read ghost pre-flush: %v", err)
+	} else if len(data) != 0 {
+		t.Errorf("ghost written before flush (batching broken): %d entries", len(data))
+	}
+
+	a.flushGhosts()
+
+	data, err := ghost.ReadGhost(ghostPath)
+	if err != nil {
+		t.Fatalf("read ghost post-flush: %v", err)
+	}
+	if len(data) != 2 {
+		t.Fatalf("post-flush entries = %d, want 2", len(data))
+	}
+	if _, ok := data["a.txt"]; !ok {
+		t.Error("a.txt missing post-flush")
+	}
+	if _, ok := data["b.txt"]; !ok {
+		t.Error("b.txt missing post-flush")
+	}
+}
+
+// TestCheckQuickCheckMetadataSelfHeals verifies that a quick check rehashing a
+// file whose modtime drifted (but content is intact) refreshes the stored
+// metadata, so the next quick check hits the cached path instead of rehashing
+// forever.
+func TestCheckQuickCheckMetadataSelfHeals(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "file.txt")
+	content := []byte("unchanged content")
+	if err := os.WriteFile(filePath, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	ghostPath := filepath.Join(tmpDir, ".ghost")
+
+	// Add: records hash + size + modtime.
+	add := NewApp()
+	add.Config.Force = true
+	add.Config.Quiet = true
+	add.Config.Parallel = 1
+	ctx := context.Background()
+	add.AddF(ctx, filePath, ghostPath, tmpDir)
+	add.flushGhosts()
+
+	storedBefore, _ := ghost.ReadGhost(ghostPath)
+
+	// Drift the modtime without changing content.
+	future := time.Now().Add(2 * time.Hour)
+	if err := os.Chtimes(filePath, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	// First quick check: rehashes (metadata drifted), content matches, self-heals.
+	a1 := NewApp()
+	a1.Config.Quiet = true
+	a1.Config.Parallel = 1
+	a1.AlwaysRehash = false // -qc mode
+	if err := a1.ProcessFiles(ctx, tmpDir, false,
+		func(ctx context.Context, fp, gp, bp string) { a1.CheckF(ctx, fp, gp, bp) }, "check"); err != nil {
+		t.Fatalf("first check error: %v", err)
+	}
+	if a1.Stats.OK.Load() != 1 {
+		t.Errorf("first check ok = %d, want 1", a1.Stats.OK.Load())
+	}
+	if a1.Stats.Bytes.Load() != int64(len(content)) {
+		t.Errorf("first check bytes = %d, want %d (should have rehashed)", a1.Stats.Bytes.Load(), len(content))
+	}
+
+	// Metadata must now be refreshed on disk.
+	storedAfter, _ := ghost.ReadGhost(ghostPath)
+	if storedAfter["file.txt"].Modified.Equal(storedBefore["file.txt"].Modified) {
+		t.Error("modified time was not refreshed after self-heal")
+	}
+	if !storedAfter["file.txt"].Modified.Equal(future) {
+		t.Errorf("modified time = %v, want %v", storedAfter["file.txt"].Modified, future)
+	}
+
+	// Second quick check: should hit the cached path (no rehash, no bytes).
+	a2 := NewApp()
+	a2.Config.Quiet = true
+	a2.Config.Parallel = 1
+	a2.AlwaysRehash = false
+	if err := a2.ProcessFiles(ctx, tmpDir, false,
+		func(ctx context.Context, fp, gp, bp string) { a2.CheckF(ctx, fp, gp, bp) }, "check"); err != nil {
+		t.Fatalf("second check error: %v", err)
+	}
+	if a2.Stats.OK.Load() != 1 {
+		t.Errorf("second check ok = %d, want 1", a2.Stats.OK.Load())
+	}
+	if a2.Stats.Bytes.Load() != 0 {
+		t.Errorf("second check bytes = %d, want 0 (should be cached)", a2.Stats.Bytes.Load())
 	}
 }

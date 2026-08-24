@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,8 +21,9 @@ import (
 )
 
 const (
-	boundedMapCap   = 1024
-	workerQueueSize = 1000
+	boundedMapCap    = 1024
+	workerQueueSize  = 1000
+	spinnerThreshold = 128 << 20 // files larger than this get an activity spinner
 )
 
 // Stats tracks operation statistics with thread-safe atomic operations.
@@ -35,6 +37,8 @@ type Stats struct {
 	Deleted   atomic.Int64
 	Modified  atomic.Int64
 	Updated   atomic.Int64
+	Missing   atomic.Int64
+	Bytes     atomic.Int64
 }
 
 // Snapshot returns a read-only snapshot of all statistics.
@@ -49,6 +53,8 @@ func (s *Stats) Snapshot() map[string]int64 {
 		"deleted":   s.Deleted.Load(),
 		"modified":  s.Modified.Load(),
 		"updated":   s.Updated.Load(),
+		"missing":   s.Missing.Load(),
+		"bytes":     s.Bytes.Load(),
 	}
 }
 
@@ -107,12 +113,15 @@ type App struct {
 	AlwaysRehash bool
 	DryRun       bool
 	JSONOutput   bool
+	Verbosity    int
+	RawBytes     bool
 	StartTime    time.Time
 	Stats        Stats
 
 	configCache *boundedMap[config.Config]
-	ghostMutex  sync.Map
+	ghosts      sync.Map // ghostPath -> *ghostState (per-ghost write-back cache)
 	outputMu    sync.Mutex
+	currentFile atomic.Value // basename of the file currently being processed
 }
 
 // NewApp creates a new App with default configuration.
@@ -125,20 +134,124 @@ func NewApp() *App {
 	}
 }
 
-// getGhostMutex returns the canonical mutex for a given ghost-file path.
-func (a *App) getGhostMutex(ghostPath string) *sync.Mutex {
-	v, _ := a.ghostMutex.LoadOrStore(ghostPath, &sync.Mutex{})
-	return v.(*sync.Mutex)
+// ghostState is the in-memory write-back cache entry for one .ghost file. It
+// coalesces per-file mutations so a directory of N files produces at most one
+// parse and one write per run instead of N of each.
+type ghostState struct {
+	mu        sync.Mutex
+	path      string
+	data      map[string]ghost.FileData
+	loadErr   error // cached load error; nil on success or never-loaded
+	loaded    bool
+	dirty     bool // real mutation (add/del): flush failure is a hard error
+	metaDirty bool // only metadata refreshed: flush failure tolerated (read-only media)
 }
 
-// Logf logs a formatted message unless quiet mode is enabled.
-func (a *App) Logf(format string, args ...any) {
-	if !a.Config.Quiet && !a.JSONOutput {
-		a.outputMu.Lock()
-		a.clearProgress()
-		fmt.Printf(format, args...)
-		a.outputMu.Unlock()
+// getGhostState returns the canonical cache entry for a ghost path.
+func (a *App) getGhostState(ghostPath string) *ghostState {
+	v, _ := a.ghosts.LoadOrStore(ghostPath, &ghostState{path: ghostPath})
+	return v.(*ghostState)
+}
+
+// ensureGhostLoaded populates st.data from disk once; subsequent calls return
+// the cached result. Caller must hold st.mu.
+func (a *App) ensureGhostLoaded(st *ghostState) error {
+	if st.loaded {
+		return st.loadErr
 	}
+	st.loaded = true
+	data, err := ghost.ReadGhost(st.path)
+	if err != nil {
+		st.data = make(map[string]ghost.FileData)
+		st.loadErr = err
+		return err
+	}
+	st.data = data
+	return nil
+}
+
+// snapshotGhostData returns a copy of a cached ghost's data, or (nil,false) if
+// the ghost was never loaded during this run. Used by reportMissing so the
+// missing-detection pass does not re-parse disk.
+func (a *App) snapshotGhostData(ghostPath string) (map[string]ghost.FileData, bool) {
+	v, ok := a.ghosts.Load(ghostPath)
+	if !ok {
+		return nil, false
+	}
+	st := v.(*ghostState)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if !st.loaded {
+		return nil, false
+	}
+	cp := make(map[string]ghost.FileData, len(st.data))
+	for k, fd := range st.data {
+		cp[k] = fd
+	}
+	return cp, true
+}
+
+// flushGhosts writes every dirty cache entry back to disk. Called after all
+// workers have drained so there is no contention on ghostState.mu. Lock order
+// is ghostState.mu -> outputMu (via Logt on error); no path acquires them in
+// the reverse order, so this is deadlock-free.
+func (a *App) flushGhosts() {
+	a.ghosts.Range(func(_, v any) bool {
+		st := v.(*ghostState)
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		if !st.loaded || (!st.dirty && !st.metaDirty) {
+			return true
+		}
+		hadRealMutation := st.dirty
+		if err := ghost.WriteGhost(st.data, st.path); err != nil {
+			if hadRealMutation {
+				a.Stats.Errors.Add(1)
+				a.Logt(output.TagError, "Failed to write %s: %v\n", st.path, err)
+			} else {
+				// Metadata self-heal failed — most likely read-only media.
+				// Tolerate so check stays usable there.
+				a.Logt(output.TagRefresh, "Could not refresh metadata in %s: %v\n", st.path, err)
+			}
+			return true
+		}
+		st.dirty = false
+		st.metaDirty = false
+		return true
+	})
+}
+
+// ── logging ──────────────────────────────────────────────────────────────────
+
+// shouldLog reports whether a tagged message passes the output gates.
+func (a *App) shouldLog(tag output.TagSpec) bool {
+	if a.JSONOutput || a.Config.Quiet {
+		return false
+	}
+	return tag.Level <= a.Verbosity
+}
+
+// Logt logs a tagged, formatted message. Tags carry their own color and
+// verbosity level; see the tag registry in internal/output.
+func (a *App) Logt(tag output.TagSpec, format string, args ...any) {
+	if !a.shouldLog(tag) {
+		return
+	}
+	a.outputMu.Lock()
+	defer a.outputMu.Unlock()
+	a.clearProgressLocked()
+	fmt.Printf("%s %s", tag.String(), fmt.Sprintf(format, args...))
+}
+
+// Logf logs an untagged formatted message unless quiet mode is enabled.
+func (a *App) Logf(format string, args ...any) {
+	if a.Config.Quiet || a.JSONOutput {
+		return
+	}
+	a.outputMu.Lock()
+	defer a.outputMu.Unlock()
+	a.clearProgressLocked()
+	fmt.Printf(format, args...)
 }
 
 // JSONLog emits a structured JSON event when JSON output mode is enabled.
@@ -152,23 +265,46 @@ func (a *App) JSONLog(event map[string]any) {
 	fmt.Println(string(b))
 }
 
+// progressOn reports whether the progress bar may be rendered.
+func (a *App) progressOn() bool {
+	return a.Config.ShowProgress && !a.Config.Quiet && !a.JSONOutput && output.StdoutIsTTY
+}
+
 // PrintProgress renders a progress bar to the terminal.
 func (a *App) PrintProgress(current, total int64, operation string) {
-	if !a.Config.ShowProgress || a.Config.Quiet || a.JSONOutput {
+	if !a.progressOn() {
 		return
 	}
 	a.outputMu.Lock()
 	defer a.outputMu.Unlock()
-	pb := output.NewProgressBar(40)
+	elapsed := time.Since(a.StartTime)
+	var rate float64
+	if elapsed > 0 {
+		rate = float64(a.Stats.Bytes.Load()) / elapsed.Seconds()
+	}
+	file, _ := a.currentFile.Load().(string)
 	fmt.Print("\r\033[K")
-	fmt.Print(pb.Render(current, total, operation))
+	fmt.Print(output.RenderProgress(output.ProgressState{
+		Op:          operation,
+		Current:     current,
+		Total:       total,
+		BytesPerSec: rate,
+		Elapsed:     elapsed,
+		File:        file,
+	}))
 }
 
-func (a *App) clearProgress() {
-	if !a.Config.ShowProgress || a.Config.Quiet || a.JSONOutput {
+func (a *App) clearProgressLocked() {
+	if !a.progressOn() {
 		return
 	}
 	fmt.Print("\r\033[K")
+}
+
+func (a *App) clearProgress() {
+	a.outputMu.Lock()
+	defer a.outputMu.Unlock()
+	a.clearProgressLocked()
 }
 
 // ── config ───────────────────────────────────────────────────────────────────
@@ -244,24 +380,25 @@ func (a *App) AddF(ctx context.Context, filePath, ghostPath, basePath string) {
 		return
 	}
 	if a.IsIgnored(filePath, basePath, false) {
-		a.Logf("%s[IGNORE]%s %s\n", output.ColorYellow, output.ColorReset, filePath)
+		a.Logt(output.TagIgnore, "%s", filePath)
 		a.Stats.Skipped.Add(1)
 		return
 	}
 
 	currentHash, err := hash.CalcHash(filePath, a.Config.Buffer)
 	if err != nil {
-		a.Logf("%s[ERROR]%s Failed to hash '%s': %v\n", output.ColorRed, output.ColorReset, filePath, err)
+		a.Logt(output.TagError, "Failed to hash '%s': %v", filePath, err)
 		a.Stats.Errors.Add(1)
 		return
 	}
 
 	st, err := os.Lstat(filePath)
 	if err != nil {
-		a.Logf("%s[ERROR]%s Failed to access '%s': %v\n", output.ColorRed, output.ColorReset, filePath, err)
+		a.Logt(output.TagError, "Failed to access '%s': %v", filePath, err)
 		a.Stats.Errors.Add(1)
 		return
 	}
+	a.Stats.Bytes.Add(st.Size())
 
 	filename := filepath.Base(filePath)
 
@@ -269,70 +406,68 @@ func (a *App) AddF(ctx context.Context, filePath, ghostPath, basePath string) {
 	var promptFilename string
 	shouldPrompt := false
 	if !a.Config.Force {
-		mu := a.getGhostMutex(ghostPath)
-		mu.Lock()
-		preData, preErr := ghost.ReadGhost(ghostPath)
-		mu.Unlock()
-		if preErr == nil {
-			if stored, exists := preData[filename]; exists && stored.Blake2b != currentHash {
-				shouldPrompt = true
-				promptHash = stored.Blake2b
-				promptFilename = filename
-			}
-		} else {
-			a.Logf("%s[ERROR]%s %v\n", output.ColorRed, output.ColorReset, preErr)
+		gs := a.getGhostState(ghostPath)
+		gs.mu.Lock()
+		if err := a.ensureGhostLoaded(gs); err != nil {
+			gs.mu.Unlock()
+			a.Logt(output.TagError, "%v", err)
 			a.Stats.Errors.Add(1)
 			return
 		}
+		if stored, exists := gs.data[filename]; exists && stored.Blake2b != currentHash {
+			shouldPrompt = true
+			promptHash = stored.Blake2b
+			promptFilename = filename
+		}
+		gs.mu.Unlock()
 	}
 	if shouldPrompt {
 		if !output.IsStdinInteractive() {
-			a.Logf("%s[WARNING]%s '%s' already tracked with a different hash. Skipping overwrite (stdin is not a terminal; use -f to force).\n", output.ColorYellow, output.ColorReset, promptFilename)
+			a.Logt(output.TagWarning, "'%s' already tracked with a different hash. Skipping overwrite (stdin is not a terminal; use -f to force).\n", promptFilename)
 			return
 		}
 		a.outputMu.Lock()
-		a.clearProgress()
-		fmt.Printf("%s[WARNING]%s '%s' already tracked with a different hash.\n", output.ColorYellow, output.ColorReset, promptFilename)
+		a.clearProgressLocked()
+		fmt.Printf("%s '%s' already tracked with a different hash.\n", output.TagWarning.String(), promptFilename)
 		fmt.Printf("  Existing: %s\n  Current:  %s\n", promptHash, currentHash)
 		fmt.Print("  Overwrite? (y/n): ")
 		a.outputMu.Unlock()
 		var resp string
 		fmt.Scanln(&resp)
 		if resp != "y" && resp != "Y" {
-			a.Logf("%s[CANCELLED]%s %s\n", output.ColorYellow, output.ColorReset, promptFilename)
+			a.Logt(output.TagCancelled, "%s\n", promptFilename)
 			return
 		}
 	}
 
-	mu := a.getGhostMutex(ghostPath)
-	mu.Lock()
-	defer mu.Unlock()
+	gs := a.getGhostState(ghostPath)
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
 
-	data, err := ghost.ReadGhost(ghostPath)
-	if err != nil {
-		a.Logf("%s[ERROR]%s %v\n", output.ColorRed, output.ColorReset, err)
+	if err := a.ensureGhostLoaded(gs); err != nil {
+		a.Logt(output.TagError, "%v\n", err)
 		a.Stats.Errors.Add(1)
 		return
 	}
 
-	if stored, exists := data[filename]; exists {
+	if stored, exists := gs.data[filename]; exists {
 		if currentHash == stored.Blake2b {
-			a.Logf("%s[UNCHANGED]%s %s\n", output.ColorGray, output.ColorReset, filename)
+			a.Logt(output.TagUnchanged, "%s\n", filename)
 			return
 		}
 		if shouldPrompt && stored.Blake2b != promptHash {
-			a.Logf("%s[WARN]%s Ghost data changed during prompt. Proceeding with update.\n", output.ColorYellow, output.ColorReset)
+			a.Logt(output.TagWarning, "Ghost data changed during prompt. Proceeding with update.\n")
 		}
 		a.Stats.Modified.Add(1)
-		a.Logf("%s[UPDATED]%s %s\n", output.ColorBlue, output.ColorReset, filename)
+		a.Logt(output.TagUpdated, "%s\n", filename)
 	} else {
 		a.Stats.Added.Add(1)
-		a.Logf("%s[ADDED]%s %s\n", output.ColorGreen, output.ColorReset, filename)
+		a.Logt(output.TagAdded, "%s\n", filename)
 	}
 
-	data[filename] = ghost.FileData{Blake2b: currentHash, Size: st.Size(), Modified: st.ModTime()}
+	gs.data[filename] = ghost.FileData{Blake2b: currentHash, Size: st.Size(), Modified: st.ModTime()}
 	if a.DryRun {
-		a.Logf("%s[DRY-RUN]%s Would write %s to %s\n", output.ColorYellow, output.ColorReset, filename, ghostPath)
+		a.Logt(output.TagDryRun, "Would write %s to %s\n", filename, ghostPath)
 		a.JSONLog(map[string]any{
 			"event":      "dry_run",
 			"operation":  "add",
@@ -343,10 +478,7 @@ func (a *App) AddF(ctx context.Context, filePath, ghostPath, basePath string) {
 		})
 		return
 	}
-	if err := ghost.WriteGhost(data, ghostPath); err != nil {
-		a.Logf("%s[ERROR]%s %v\n", output.ColorRed, output.ColorReset, err)
-		a.Stats.Errors.Add(1)
-	}
+	gs.dirty = true
 }
 
 // DelF removes a single file from its parent .ghost file.
@@ -354,26 +486,25 @@ func (a *App) DelF(ctx context.Context, filePath, ghostPath, _ string) {
 	if ctx.Err() != nil {
 		return
 	}
-	mu := a.getGhostMutex(ghostPath)
-	mu.Lock()
-	defer mu.Unlock()
+	gs := a.getGhostState(ghostPath)
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
 
-	data, err := ghost.ReadGhost(ghostPath)
-	if err != nil {
-		a.Logf("%s[ERROR]%s %v\n", output.ColorRed, output.ColorReset, err)
+	if err := a.ensureGhostLoaded(gs); err != nil {
+		a.Logt(output.TagError, "%v\n", err)
 		a.Stats.Errors.Add(1)
 		return
 	}
 
 	filename := filepath.Base(filePath)
-	if _, exists := data[filename]; !exists {
-		a.Logf("%s[NOT FOUND]%s '%s' not in ghost database.\n", output.ColorYellow, output.ColorReset, filename)
+	if _, exists := gs.data[filename]; !exists {
+		a.Logt(output.TagNotFound, "'%s' is not tracked in %s — nothing to delete\n", filename, ghostPath)
 		return
 	}
 
-	delete(data, filename)
+	delete(gs.data, filename)
 	a.Stats.Deleted.Add(1)
-	a.Logf("%s[DELETED]%s %s\n", output.ColorRed, output.ColorReset, filename)
+	a.Logt(output.TagDeleted, "%s\n", filename)
 	a.JSONLog(map[string]any{
 		"event":      "deleted",
 		"file":       filename,
@@ -381,13 +512,10 @@ func (a *App) DelF(ctx context.Context, filePath, ghostPath, _ string) {
 	})
 
 	if a.DryRun {
-		a.Logf("%s[DRY-RUN]%s Would remove %s from %s\n", output.ColorYellow, output.ColorReset, filename, ghostPath)
+		a.Logt(output.TagDryRun, "Would remove %s from %s\n", filename, ghostPath)
 		return
 	}
-	if err := ghost.WriteGhost(data, ghostPath); err != nil {
-		a.Logf("%s[ERROR]%s %v\n", output.ColorRed, output.ColorReset, err)
-		a.Stats.Errors.Add(1)
-	}
+	gs.dirty = true
 }
 
 // CheckF verifies a single file against its stored hash.
@@ -400,21 +528,20 @@ func (a *App) CheckF(ctx context.Context, filePath, ghostPath, basePath string) 
 		return
 	}
 
-	mu := a.getGhostMutex(ghostPath)
-	mu.Lock()
-	data, err := ghost.ReadGhost(ghostPath)
-	mu.Unlock()
-
-	if err != nil {
+	gs := a.getGhostState(ghostPath)
+	gs.mu.Lock()
+	if err := a.ensureGhostLoaded(gs); err != nil {
+		gs.mu.Unlock()
 		a.Stats.Errors.Add(1)
-		a.Logf("%s[ERROR]%s %v\n", output.ColorRed, output.ColorReset, err)
+		a.Logt(output.TagError, "%v\n", err)
 		return
 	}
-
 	filename := filepath.Base(filePath)
-	stored, exists := data[filename]
+	stored, exists := gs.data[filename]
+	gs.mu.Unlock()
+
 	if !exists {
-		a.Logf("%s[NOT TRACKED]%s %s\n", output.ColorYellow, output.ColorReset, filename)
+		a.Logt(output.TagNotTracked, "%s\n", filename)
 		return
 	}
 
@@ -423,31 +550,127 @@ func (a *App) CheckF(ctx context.Context, filePath, ghostPath, basePath string) 
 	st, err := os.Lstat(filePath)
 	if err != nil {
 		a.Stats.Errors.Add(1)
-		a.Logf("%s[ERROR]%s Failed to stat '%s': %v\n", output.ColorRed, output.ColorReset, filePath, err)
+		a.Logt(output.TagError, "Failed to stat '%s': %v\n", filePath, err)
 		return
 	}
 
 	if !a.AlwaysRehash && !ghost.NeedsRehash(st, stored) {
 		a.Stats.OK.Add(1)
-		a.Logf("%s[OK]%s %s %s(cached)%s\n", output.ColorGreen, output.ColorReset, filename, output.ColorGray, output.ColorReset)
+		a.Logt(output.TagOK, "%s %s(cached)%s\n", filename, output.ColorGray, output.ColorReset)
 		return
 	}
 
 	currentHash, err := hash.CalcHash(filePath, a.Config.Buffer)
 	if err != nil {
 		a.Stats.Errors.Add(1)
-		a.Logf("%s[ERROR]%s %v\n", output.ColorRed, output.ColorReset, err)
+		a.Logt(output.TagError, "%v\n", err)
+		return
+	}
+	a.Stats.Bytes.Add(st.Size())
+
+	if currentHash != stored.Blake2b {
+		a.Stats.Corrupted.Add(1)
+		a.Logt(output.TagCorrupted, "%s\n  Expected: %s\n  Current:  %s\n",
+			filename, stored.Blake2b, currentHash)
 		return
 	}
 
-	if currentHash == stored.Blake2b {
-		a.Stats.OK.Add(1)
-		a.Logf("%s[OK]%s %s\n", output.ColorGreen, output.ColorReset, filename)
-	} else {
-		a.Stats.Corrupted.Add(1)
-		a.Logf("%s[CORRUPTED]%s %s\n  Expected: %s\n  Current:  %s\n",
-			output.ColorRed, output.ColorReset, filename, stored.Blake2b, currentHash)
+	// Content intact.
+	a.Stats.OK.Add(1)
+	a.Logt(output.TagOK, "%s\n", filename)
+
+	// Self-heal: a quick check rehashes only when size/modtime drifted. If
+	// the content still matches, refresh the stored metadata so the next
+	// quick check can skip the rehash. Without this the file would rehash
+	// on every run, degrading -qc to a full check permanently. Tolerated on
+	// read-only media (flush failure is logged at debug, not fatal).
+	if !a.AlwaysRehash && ghost.NeedsRehash(st, stored) && !a.DryRun {
+		gs.mu.Lock()
+		gs.data[filename] = ghost.FileData{Blake2b: stored.Blake2b, Size: st.Size(), Modified: st.ModTime()}
+		gs.metaDirty = true
+		gs.mu.Unlock()
+		a.Logt(output.TagRefresh, "%s metadata refreshed\n", filename)
 	}
+}
+
+// walkEligible walks path and invokes onFile for every file eligible for
+// processing, along with its resolved ghost path. onDir fires for each
+// non-skipped subdirectory, onMeta for .ghost/.ghostconf files. The same
+// walker backs both the counting pre-pass and the dispatch pass so their
+// filtering logic can never diverge; logOutput silences per-path logs
+// during the counting pass.
+func (a *App) walkEligible(ctx context.Context, path string, recursive bool, logOutput bool,
+	onFile func(filePath, ghostPath string, d fs.DirEntry),
+	onDir func(dirPath string),
+	onMeta func(filePath string),
+) error {
+	dirConfigCache := make(map[string]config.Config)
+	getDirCfg := func(dir string) config.Config {
+		if c, ok := dirConfigCache[dir]; ok {
+			return c
+		}
+		c := a.getConfigForPath(dir)
+		dirConfigCache[dir] = c
+		return c
+	}
+
+	return filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if logOutput {
+				a.Logt(output.TagError, "Accessing '%s': %v\n", filePath, err)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		isDir := d.IsDir()
+		if !recursive && isDir && filePath != path {
+			return filepath.SkipDir
+		}
+		if isDir && filePath != path {
+			dirCfg := getDirCfg(filePath)
+			if config.IsIgnoredWithConfig(dirCfg, filePath, path, true) {
+				if logOutput {
+					a.Logt(output.TagSkipDir, "%s\n", filePath)
+				}
+				return filepath.SkipDir
+			}
+			if onDir != nil {
+				onDir(filePath)
+			}
+			return nil
+		}
+		if isDir {
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if d.Name() == ".ghost" || d.Name() == ".ghostconf" {
+			if onMeta != nil {
+				onMeta(filePath)
+			}
+			return nil
+		}
+		dirPath := filepath.Dir(filePath)
+		dirCfg := getDirCfg(dirPath)
+		if config.IsIgnoredWithConfig(dirCfg, filePath, path, false) {
+			a.Stats.Skipped.Add(1)
+			if logOutput {
+				a.Logt(output.TagIgnore, "%s\n", filePath)
+			}
+			return nil
+		}
+		localGhostPath := filepath.Join(dirPath, ".ghost")
+		if !recursive {
+			localGhostPath = filepath.Join(path, ".ghost")
+		}
+		if onFile != nil {
+			onFile(filePath, localGhostPath, d)
+		}
+		return nil
+	})
 }
 
 // ProcessFiles walks path and dispatches each file to operation via a worker pool.
@@ -463,11 +686,29 @@ func (a *App) ProcessFiles(ctx context.Context, path string, recursive bool,
 	}
 	if !fi.IsDir() {
 		dirPath := filepath.Dir(path)
+		var sp *output.Spinner
+		if a.progressOn() && fi.Size() >= spinnerThreshold {
+			sp = output.NewSpinner(&a.outputMu,
+				fmt.Sprintf("Hashing %s (%s)", filepath.Base(path), output.HumanBytes(fi.Size())))
+			sp.Start()
+		}
 		operation(ctx, path, filepath.Join(dirPath, ".ghost"), dirPath)
+		if sp != nil {
+			sp.Stop()
+		}
+		a.flushGhosts()
 		return nil
 	}
 
-	a.Logf("%s[PROCESSING]%s Directory: %s (recursive: %v)\n", output.ColorCyan, output.ColorReset, path, recursive)
+	a.Logt(output.TagProcessing, "Directory: %s (recursive: %v)\n", path, recursive)
+
+	// Counting pre-pass: gives the progress bar a real total. Stat-free and
+	// cheap compared to hashing; skipped entirely when progress is disabled.
+	var total int64
+	if a.progressOn() {
+		_ = a.walkEligible(ctx, path, recursive, false,
+			func(_, _ string, _ fs.DirEntry) { total++ }, nil, nil)
+	}
 
 	jobChan := make(chan workItem, workerQueueSize)
 	var wg sync.WaitGroup
@@ -485,107 +726,147 @@ func (a *App) ProcessFiles(ctx context.Context, path string, recursive bool,
 				if ctx.Err() != nil {
 					continue
 				}
+				a.currentFile.Store(filepath.Base(job.filePath))
 				operation(ctx, job.filePath, job.ghostPath, job.basePath)
 				cur := processed.Add(1)
 				if cur%10 == 0 {
-					a.PrintProgress(cur, 0, operationName)
+					a.PrintProgress(cur, total, operationName)
 				}
 			}
 		}()
 	}
 
-	dirConfigCache := make(map[string]config.Config)
-	getDirCfg := func(dir string) config.Config {
-		if c, ok := dirConfigCache[dir]; ok {
-			return c
-		}
-		c := a.getConfigForPath(dir)
-		dirConfigCache[dir] = c
-		return c
+	// seen tracks dispatched filenames per ghost file so that a check pass can
+	// afterwards report tracked entries whose files have vanished from disk.
+	var seen map[string]map[string]struct{}
+	if operationName == "check" {
+		seen = make(map[string]map[string]struct{})
 	}
+	sawGhost := false
 
-	walkErr := filepath.WalkDir(path, func(filePath string, d fs.DirEntry, err error) error {
-		if err != nil {
-			a.Logf("%s[ERROR]%s Accessing '%s': %v\n", output.ColorRed, output.ColorReset, filePath, err)
-			return nil
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		isDir := d.IsDir()
-		if !recursive && isDir && filePath != path {
-			return filepath.SkipDir
-		}
-		if isDir && filePath != path {
-			dirCfg := getDirCfg(filePath)
-			if config.IsIgnoredWithConfig(dirCfg, filePath, path, true) {
-				a.Logf("%s[SKIP DIR]%s %s\n", output.ColorYellow, output.ColorReset, filePath)
-				return filepath.SkipDir
+	walkErr := a.walkEligible(ctx, path, recursive, true,
+		func(filePath, ghostPath string, d fs.DirEntry) {
+			if seen != nil {
+				if seen[ghostPath] == nil {
+					seen[ghostPath] = make(map[string]struct{})
+				}
+				seen[ghostPath][d.Name()] = struct{}{}
 			}
-			return nil
-		}
-		if isDir {
-			return nil
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		if d.Name() == ".ghost" || d.Name() == ".ghostconf" {
-			return nil
-		}
-		dirPath := filepath.Dir(filePath)
-		dirCfg := getDirCfg(dirPath)
-		if config.IsIgnoredWithConfig(dirCfg, filePath, path, false) {
-			a.Stats.Skipped.Add(1)
-			return nil
-		}
-		localGhostPath := filepath.Join(dirPath, ".ghost")
-		if !recursive {
-			localGhostPath = filepath.Join(path, ".ghost")
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case jobChan <- workItem{filePath, localGhostPath, path}:
-		}
-		return nil
-	})
+			select {
+			case <-ctx.Done():
+			case jobChan <- workItem{filePath, ghostPath, path}:
+			}
+		},
+		func(dirPath string) {
+			rel, err := filepath.Rel(path, dirPath)
+			if err != nil {
+				rel = dirPath
+			}
+			a.Logt(output.TagDir, "%s\n", rel)
+		},
+		func(string) { sawGhost = true },
+	)
 
 	close(jobChan)
 	wg.Wait()
 	a.clearProgress()
+	// Flush the write-back cache before reporting or returning: this writes
+	// every mutated .ghost once, and on cancel it preserves completed work.
+	a.flushGhosts()
 
 	if walkErr != nil && walkErr != context.Canceled {
 		return fmt.Errorf("error processing directory: %w", walkErr)
 	}
-	a.Logf("%s[COMPLETED]%s Processed %d file(s)\n", output.ColorGreen, output.ColorReset, processed.Load())
+
+	if operationName == "check" && ctx.Err() == nil {
+		if !sawGhost {
+			hintCmd := "dataGhost add"
+			if recursive {
+				hintCmd += " -r"
+			}
+			a.Logt(output.TagHint, "No .ghost found under %s — run '%s %s' to start tracking.\n", path, hintCmd, path)
+		}
+		a.reportMissing(ctx, seen, path)
+	}
+
+	a.Logt(output.TagCompleted, "Processed %d file(s)\n", processed.Load())
 	return nil
+}
+
+// reportMissing diffs ghost entries against the files seen during a check walk
+// and reports tracked files that no longer exist on disk.
+func (a *App) reportMissing(ctx context.Context, seen map[string]map[string]struct{}, root string) {
+	if len(seen) == 0 {
+		return
+	}
+	ghostPaths := make([]string, 0, len(seen))
+	for gp := range seen {
+		ghostPaths = append(ghostPaths, gp)
+	}
+	sort.Strings(ghostPaths)
+
+	for _, gp := range ghostPaths {
+		if ctx.Err() != nil {
+			return
+		}
+		data, ok := a.snapshotGhostData(gp)
+		if !ok {
+			continue // read errors were already reported by the check workers
+		}
+		dirPath := filepath.Dir(gp)
+		var missing []string
+		for name := range data {
+			if _, ok := seen[gp][name]; ok {
+				continue
+			}
+			// A tracked file that matches the ignore rules was never dispatched;
+			// do not report it as missing.
+			if a.IsIgnored(filepath.Join(dirPath, name), root, false) {
+				continue
+			}
+			missing = append(missing, name)
+		}
+		sort.Strings(missing)
+		for _, name := range missing {
+			a.Stats.Missing.Add(1)
+			rel := filepath.Join(dirPath, name)
+			if r, err := filepath.Rel(root, rel); err == nil {
+				rel = r
+			}
+			a.Logt(output.TagMissing, "%s — tracked but not found on disk\n", rel)
+			a.JSONLog(map[string]any{
+				"event":      "missing",
+				"file":       rel,
+				"ghost_path": gp,
+			})
+		}
+	}
 }
 
 // cleanGhostFile removes entries for missing files from a single ghost file.
 func (a *App) cleanGhostFile(ghostPath string) int64 {
 	dirPath := filepath.Dir(ghostPath)
-	mu := a.getGhostMutex(ghostPath)
-	mu.Lock()
-	defer mu.Unlock()
+	gs := a.getGhostState(ghostPath)
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
 
 	data, err := ghost.ReadGhost(ghostPath)
 	if err != nil {
-		a.Logf("%s[ERROR]%s Failed to read %s: %v\n", output.ColorRed, output.ColorReset, ghostPath, err)
+		a.Logt(output.TagError, "Failed to read %s: %v\n", ghostPath, err)
 		a.Stats.Errors.Add(1)
 		return 0
 	}
 	removed := 0
 	for filename := range data {
 		if _, err := os.Lstat(filepath.Join(dirPath, filename)); os.IsNotExist(err) {
-			a.Logf("%s[MISSING]%s Removing entry for %s\n", output.ColorYellow, output.ColorReset, filename)
+			a.Logt(output.TagMissing, "Removing entry for %s\n", filename)
 			delete(data, filename)
 			removed++
 		}
 	}
 	if removed > 0 {
 		if a.DryRun {
-			a.Logf("%s[DRY-RUN]%s Would clean %d missing entr(y/ies) from %s\n", output.ColorYellow, output.ColorReset, removed, ghostPath)
+			a.Logt(output.TagDryRun, "Would clean %d missing entr(y/ies) from %s\n", removed, ghostPath)
 			a.JSONLog(map[string]any{
 				"event":      "dry_run",
 				"operation":  "clean",
@@ -595,7 +876,7 @@ func (a *App) cleanGhostFile(ghostPath string) int64 {
 			return int64(removed)
 		}
 		if err := ghost.WriteGhost(data, ghostPath); err != nil {
-			a.Logf("%s[ERROR]%s Failed to write %s: %v\n", output.ColorRed, output.ColorReset, ghostPath, err)
+			a.Logt(output.TagError, "Failed to write %s: %v\n", ghostPath, err)
 			a.Stats.Errors.Add(1)
 			return 0
 		}
@@ -613,7 +894,7 @@ func (a *App) Clean(ctx context.Context, path string, recursive bool) error {
 		return fmt.Errorf("clean command requires a directory path")
 	}
 
-	a.Logf("%s[CLEANING]%s Directory: %s\n", output.ColorCyan, output.ColorReset, path)
+	a.Logt(output.TagCleaning, "Directory: %s\n", path)
 	var ghostFiles []string
 
 	if err := filepath.WalkDir(path, func(fp string, d fs.DirEntry, err error) error {
@@ -632,7 +913,7 @@ func (a *App) Clean(ctx context.Context, path string, recursive bool) error {
 	}
 
 	if len(ghostFiles) == 0 {
-		a.Logf("%s[INFO]%s No .ghost files found\n", output.ColorCyan, output.ColorReset)
+		a.Logt(output.TagInfo, "No .ghost files found under %s\n", path)
 		return nil
 	}
 
@@ -646,9 +927,9 @@ func (a *App) Clean(ctx context.Context, path string, recursive bool) error {
 	}
 
 	if totalCleaned > 0 {
-		a.Logf("%s[CLEANED]%s Removed %d missing file(s)\n", output.ColorGreen, output.ColorReset, totalCleaned)
+		a.Logt(output.TagCleaned, "Removed %d missing file(s)\n", totalCleaned)
 	} else {
-		a.Logf("%s[OK]%s No missing files found\n", output.ColorGreen, output.ColorReset)
+		a.Logt(output.TagOK, "No missing files found\n")
 	}
 	return nil
 }
@@ -657,13 +938,13 @@ func (a *App) updateGhostFile(ctx context.Context, job updateWorkItem) {
 	if ctx.Err() != nil {
 		return
 	}
-	mu := a.getGhostMutex(job.ghostPath)
-	mu.Lock()
-	defer mu.Unlock()
+	gs := a.getGhostState(job.ghostPath)
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
 
 	data, err := ghost.ReadGhost(job.ghostPath)
 	if err != nil {
-		a.Logf("%s[ERROR]%s Failed to read '%s': %v\n", output.ColorRed, output.ColorReset, job.ghostPath, err)
+		a.Logt(output.TagError, "Failed to read '%s': %v\n", job.ghostPath, err)
 		a.Stats.Errors.Add(1)
 		return
 	}
@@ -676,17 +957,18 @@ func (a *App) updateGhostFile(ctx context.Context, job updateWorkItem) {
 		filePath := filepath.Join(job.dirPath, filename)
 		st, err := os.Lstat(filePath)
 		if err != nil {
-			a.Logf("%s[WARNING]%s Cannot stat '%s': %v\n", output.ColorYellow, output.ColorReset, filename, err)
+			a.Logt(output.TagWarning, "Cannot stat '%s': %v\n", filename, err)
 			continue
 		}
 		currentHash, err := hash.CalcHash(filePath, a.Config.Buffer)
 		if err != nil {
-			a.Logf("%s[ERROR]%s Failed to hash '%s': %v\n", output.ColorRed, output.ColorReset, filename, err)
+			a.Logt(output.TagError, "Failed to hash '%s': %v\n", filename, err)
 			a.Stats.Errors.Add(1)
 			continue
 		}
+		a.Stats.Bytes.Add(st.Size())
 		if currentHash != fi.Blake2b {
-			a.Logf("%s[HASH MISMATCH]%s %s -- cannot update metadata.\n", output.ColorRed, output.ColorReset, filename)
+			a.Logt(output.TagHashMismatch, "%s -- cannot update metadata.\n", filename)
 			a.Stats.Corrupted.Add(1)
 			continue
 		}
@@ -697,7 +979,7 @@ func (a *App) updateGhostFile(ctx context.Context, job updateWorkItem) {
 
 	if updatedCount > 0 {
 		if a.DryRun {
-			a.Logf("%s[DRY-RUN]%s Would update %d metadata entr(y/ies) in %s\n", output.ColorYellow, output.ColorReset, updatedCount, job.ghostPath)
+			a.Logt(output.TagDryRun, "Would update %d metadata entr(y/ies) in %s\n", updatedCount, job.ghostPath)
 			a.JSONLog(map[string]any{
 				"event":      "dry_run",
 				"operation":  "update",
@@ -707,11 +989,11 @@ func (a *App) updateGhostFile(ctx context.Context, job updateWorkItem) {
 			return
 		}
 		if err := ghost.WriteGhost(data, job.ghostPath); err != nil {
-			a.Logf("%s[ERROR]%s Failed to write '%s': %v\n", output.ColorRed, output.ColorReset, job.ghostPath, err)
+			a.Logt(output.TagError, "Failed to write '%s': %v\n", job.ghostPath, err)
 			a.Stats.Errors.Add(1)
 			return
 		}
-		a.Logf("%s[UPDATED]%s %d metadata update(s) in %s\n", output.ColorGreen, output.ColorReset, updatedCount, job.ghostPath)
+		a.Logt(output.TagUpdated, "%d metadata update(s) in %s\n", updatedCount, job.ghostPath)
 	}
 }
 
@@ -746,35 +1028,90 @@ func (a *App) ListGhosts(path string, recursive bool) error {
 	}
 
 	if len(ghostPaths) == 0 {
-		a.Logf("%s[INFO]%s No .ghost files found\n", output.ColorCyan, output.ColorReset)
+		a.Logt(output.TagHint, "No .ghost files found under %s — run 'dataGhost add -r %s' to start tracking.\n", path, path)
 		return nil
 	}
+	sort.Strings(ghostPaths)
 
 	for _, gp := range ghostPaths {
 		data, err := ghost.ReadGhost(gp)
 		if err != nil {
-			a.Logf("%s[ERROR]%s Failed to read '%s': %v\n", output.ColorRed, output.ColorReset, gp, err)
+			a.Logt(output.TagError, "Failed to read '%s': %v\n", gp, err)
 			continue
 		}
 		if len(data) == 0 {
-			a.Logf("%s[INFO]%s %s: (empty)\n", output.ColorCyan, output.ColorReset, gp)
+			a.Logt(output.TagInfo, "%s: (empty)\n", gp)
 			continue
 		}
 
+		names := make([]string, 0, len(data))
+		nameW := len("FILE")
+		for name := range data {
+			names = append(names, name)
+			nameW = max(nameW, output.Width(name))
+		}
+		sort.Strings(names)
+		nameW = min(nameW, 40)
+
 		a.outputMu.Lock()
-		fmt.Printf("\n%s[GHOST]%s %s\n", output.ColorBlue, output.ColorReset, gp)
-		fmt.Printf("  %-40s %-66s %10s %20s\n", "FILE", "BLAKE2B", "SIZE", "MODIFIED")
-		fmt.Printf("  %s\n", strings.Repeat("─", 140))
-		for filename, fd := range data {
-			sizeStr := fmt.Sprintf("%d", fd.Size)
+		fmt.Printf("\n%s %s\n", output.TagGhost.String(), gp)
+		fmt.Printf("  %s %-64s %10s  %-19s\n",
+			output.Pad("FILE", nameW), "BLAKE2B", "SIZE", "MODIFIED")
+		fmt.Printf("  %s\n", strings.Repeat(output.Glyphs.BoxH, nameW+64+10+19+3))
+		for _, name := range names {
+			fd := data[name]
+			sizeStr := output.HumanBytes(fd.Size)
+			if a.RawBytes {
+				sizeStr = fmt.Sprintf("%d", fd.Size)
+			}
 			modStr := fd.Modified.Format("2006-01-02 15:04:05")
 			if fd.Modified.IsZero() {
 				modStr = "-"
 			}
-			fmt.Printf("  %-40s %-66s %10s %20s\n", filename, fd.Blake2b, sizeStr, modStr)
+			fmt.Printf("  %s %-64s %10s  %-19s\n",
+				output.Pad(output.Truncate(name, nameW), nameW), fd.Blake2b, sizeStr, modStr)
 		}
 		a.outputMu.Unlock()
 	}
+	return nil
+}
+
+// ghostconfTemplate is written by the init command.
+const ghostconfTemplate = `# dataGhost configuration
+# Files and directories to skip (globs, names, or paths relative to the target):
+ignore:
+  - "*.tmp"
+  - "*.log"
+  - ".git/"
+
+# buffer: 262144       # read buffer size in bytes (0 = auto-sized)
+# parallel: 4          # worker count (default: CPU count)
+# quiet: false         # print only a one-line summary
+# show_progress: true  # render the progress bar
+# force: false         # overwrite tracked hashes without prompting
+`
+
+// InitConfig writes a commented .ghostconf template into dir.
+func (a *App) InitConfig(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("failed to access path '%s': %w", dir, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("init requires a directory path")
+	}
+	target := filepath.Join(dir, ".ghostconf")
+	if _, err := os.Lstat(target); err == nil && !a.Config.Force {
+		return fmt.Errorf(".ghostconf already exists at '%s' (use -f to overwrite)", target)
+	}
+	if a.DryRun {
+		a.Logt(output.TagDryRun, "Would create %s\n", target)
+		return nil
+	}
+	if err := os.WriteFile(target, []byte(ghostconfTemplate), 0644); err != nil {
+		return fmt.Errorf("failed to write '%s': %w", target, err)
+	}
+	a.Logt(output.TagCreated, "%s — edit the ignore rules to taste\n", target)
 	return nil
 }
 
@@ -792,7 +1129,7 @@ func (a *App) Update(ctx context.Context, path string, recursive bool) error {
 		return fmt.Errorf("path must be a directory or a .ghost file")
 	}
 
-	a.Logf("%s[UPDATING]%s Searching for .ghost files in: %s\n", output.ColorCyan, output.ColorReset, path)
+	a.Logt(output.TagUpdating, "Searching for .ghost files in: %s\n", path)
 	var items []updateWorkItem
 
 	if err := filepath.WalkDir(path, func(fp string, d fs.DirEntry, err error) error {
@@ -811,17 +1148,14 @@ func (a *App) Update(ctx context.Context, path string, recursive bool) error {
 	}
 
 	RunWorkers(ctx, items, a.updateGhostFile, a.Config.Parallel, "update", a)
-	a.Logf("%s[COMPLETED]%s Processed %d ghost file(s)\n", output.ColorGreen, output.ColorReset, len(items))
+	a.Logt(output.TagCompleted, "Processed %d ghost file(s)\n", len(items))
 	return nil
 }
 
-// PrintSummary renders the final operation summary box (or JSON when enabled).
-func (a *App) PrintSummary() {
+// PrintSummary renders the final operation summary (box, one-liner, or JSON).
+func (a *App) PrintSummary(opName string, interrupted bool) {
 	elapsed := time.Since(a.StartTime).Round(time.Millisecond)
 	snapshot := a.Stats.Snapshot()
-
-	a.outputMu.Lock()
-	defer a.outputMu.Unlock()
 
 	if a.JSONOutput {
 		summary := map[string]any{
@@ -832,73 +1166,147 @@ func (a *App) PrintSummary() {
 		if a.DryRun {
 			summary["dry_run"] = true
 		}
+		if interrupted {
+			summary["partial"] = true
+		}
+		a.outputMu.Lock()
+		defer a.outputMu.Unlock()
 		b, _ := json.Marshal(summary)
 		fmt.Println(string(b))
 		return
 	}
 
-	a.clearProgress()
+	// Quiet mode: exactly one greppable line instead of silence.
+	if a.Config.Quiet {
+		parts := []string{}
+		add := func(key, label string) {
+			if v := snapshot[key]; v > 0 {
+				parts = append(parts, fmt.Sprintf("%d %s", v, label))
+			}
+		}
+		add("ok", "ok")
+		add("corrupted", "corrupted")
+		add("missing", "missing")
+		add("added", "added")
+		add("modified", "modified")
+		add("updated", "updated")
+		add("deleted", "deleted")
+		add("skipped", "skipped")
+		add("errors", "errors")
+		body := strings.Join(parts, ", ")
+		if body == "" {
+			body = "nothing to report"
+		}
+		line := fmt.Sprintf("dataghost %s: %s in %s", opName, body, elapsed)
+		if a.DryRun {
+			line += " [dry-run]"
+		}
+		if interrupted {
+			line += " (partial)"
+		}
+		a.outputMu.Lock()
+		defer a.outputMu.Unlock()
+		fmt.Println(line)
+		return
+	}
+
+	a.outputMu.Lock()
+	defer a.outputMu.Unlock()
+	a.clearProgressLocked()
 	fmt.Println()
 
-	const w = 43
-	top := output.ColorBlue + "╔" + strings.Repeat("═", w) + "╗" + output.ColorReset
-	mid := output.ColorBlue + "╠" + strings.Repeat("═", w) + "╣" + output.ColorReset
-	bot := output.ColorBlue + "╚" + strings.Repeat("═", w) + "╝" + output.ColorReset
-	bar := output.ColorBlue + "║" + output.ColorReset
+	// Celebrate a fully clean check.
+	if opName == "check" && snapshot["ok"] > 0 && snapshot["corrupted"] == 0 &&
+		snapshot["missing"] == 0 && snapshot["errors"] == 0 {
+		fmt.Printf("%s%s All %d files intact%s\n\n",
+			output.ColorGreen, output.Glyphs.Check, snapshot["ok"], output.ColorReset)
+	}
+
+	w := min(max(output.TermWidth()-2, 43), 64)
+	v := output.ColorBlue + output.Glyphs.BoxV + output.ColorReset
+	top := output.ColorBlue + output.Glyphs.BoxTL + strings.Repeat(output.Glyphs.BoxH, w) + output.Glyphs.BoxTR + output.ColorReset
+	mid := output.ColorBlue + output.Glyphs.BoxJoinL + strings.Repeat(output.Glyphs.BoxH, w) + output.Glyphs.BoxJoinR + output.ColorReset
+	bot := output.ColorBlue + output.Glyphs.BoxBL + strings.Repeat(output.Glyphs.BoxH, w) + output.Glyphs.BoxBR + output.ColorReset
 
 	fmt.Println(top)
 	title := "OPERATION SUMMARY"
 	lp := (w - len(title)) / 2
-	rp := w - len(title) - lp
-	fmt.Printf("%s%s%s%s%s\n", bar, strings.Repeat(" ", lp), title, strings.Repeat(" ", rp), bar)
+	fmt.Printf("%s%s%s%s%s\n", v, strings.Repeat(" ", lp), title, strings.Repeat(" ", w-len(title)-lp), v)
 	fmt.Println(mid)
 
-	line := func(label, value, vc string) {
+	line := func(label, value string, vc output.Color) {
 		pad := w - len(label) - len(value) - 2
 		if pad < 0 {
 			pad = 0
 		}
-		v := value
-		if vc != "" {
-			v = vc + value + output.ColorReset
+		val := value
+		if code := vc.Code(); code != "" {
+			val = code + value + output.ColorReset
 		}
-		fmt.Printf("%s %s%*s%s %s\n", bar, label, pad, "", v, bar)
+		fmt.Printf("%s %s%s%s %s\n", v, label, strings.Repeat(" ", pad), val, v)
+	}
+	banner := func(text string, vc output.Color) {
+		pad := w - len(text) - 2
+		if pad < 0 {
+			pad = 0
+		}
+		lp, rp := pad/2, pad-pad/2
+		val := text
+		if code := vc.Code(); code != "" {
+			val = code + text + output.ColorReset
+		}
+		fmt.Printf("%s %s%s%s %s\n", v, strings.Repeat(" ", lp), val, strings.Repeat(" ", rp), v)
 	}
 
 	if a.DryRun {
-		fmt.Printf("%s%s%s\n", bar, strings.Repeat(" ", w), bar)
-		fmt.Printf("%s%s%s%s%s\n", bar, strings.Repeat(" ", (w-7)/2), "DRY RUN", strings.Repeat(" ", (w-7)/2), bar)
-		fmt.Printf("%s%s%s\n", bar, strings.Repeat(" ", w), bar)
+		fmt.Printf("%s%s%s\n", v, strings.Repeat(" ", w), v)
+		banner("DRY RUN", output.CYellow)
+		fmt.Printf("%s%s%s\n", v, strings.Repeat(" ", w), v)
+	}
+	if interrupted {
+		banner("PARTIAL — INTERRUPTED", output.CYellow)
 	}
 
-	if v := snapshot["checked"]; v > 0 {
-		line("Checked:", fmt.Sprintf("%d", v), output.ColorCyan)
+	if n := snapshot["checked"]; n > 0 {
+		line("Checked:", fmt.Sprintf("%d", n), output.CCyan)
 	}
-	if v := snapshot["ok"]; v > 0 {
-		line("OK:", fmt.Sprintf("%d", v), output.ColorGreen)
+	if n := snapshot["ok"]; n > 0 {
+		line("OK:", fmt.Sprintf("%d", n), output.CGreen)
 	}
-	if v := snapshot["corrupted"]; v > 0 {
-		line("Corrupted:", fmt.Sprintf("%d", v), output.ColorRed)
+	if n := snapshot["corrupted"]; n > 0 {
+		line("Corrupted:", fmt.Sprintf("%d", n), output.CRed)
 	}
-	if v := snapshot["added"]; v > 0 {
-		line("Added:", fmt.Sprintf("%d", v), output.ColorGreen)
+	if n := snapshot["missing"]; n > 0 {
+		line("Missing:", fmt.Sprintf("%d", n), output.CYellow)
 	}
-	if v := snapshot["modified"]; v > 0 {
-		line("Modified:", fmt.Sprintf("%d", v), output.ColorBlue)
+	if n := snapshot["added"]; n > 0 {
+		line("Added:", fmt.Sprintf("%d", n), output.CGreen)
 	}
-	if v := snapshot["updated"]; v > 0 {
-		line("Updated:", fmt.Sprintf("%d", v), output.ColorGreen)
+	if n := snapshot["modified"]; n > 0 {
+		line("Modified:", fmt.Sprintf("%d", n), output.CBlue)
 	}
-	if v := snapshot["deleted"]; v > 0 {
-		line("Deleted:", fmt.Sprintf("%d", v), output.ColorRed)
+	if n := snapshot["updated"]; n > 0 {
+		line("Updated:", fmt.Sprintf("%d", n), output.CGreen)
 	}
-	if v := snapshot["skipped"]; v > 0 {
-		line("Skipped:", fmt.Sprintf("%d", v), output.ColorYellow)
+	if n := snapshot["deleted"]; n > 0 {
+		line("Deleted:", fmt.Sprintf("%d", n), output.CRed)
 	}
-	if v := snapshot["errors"]; v > 0 {
-		line("Errors:", fmt.Sprintf("%d", v), output.ColorRed)
+	if n := snapshot["skipped"]; n > 0 {
+		line("Skipped:", fmt.Sprintf("%d", n), output.CYellow)
 	}
-	line("Duration:", elapsed.String(), "")
+	if n := snapshot["errors"]; n > 0 {
+		line("Errors:", fmt.Sprintf("%d", n), output.CRed)
+	}
+
+	handled := snapshot["ok"] + snapshot["corrupted"] + snapshot["added"] +
+		snapshot["modified"] + snapshot["updated"] + snapshot["deleted"]
+	if handled > 0 && elapsed > 0 {
+		line("Rate:", fmt.Sprintf("%.0f files/s", float64(handled)/elapsed.Seconds()), output.CNone)
+	}
+	if n := snapshot["bytes"]; n > 0 {
+		line("Data:", fmt.Sprintf("%s at %s", output.HumanBytes(n), output.HumanRate(n, elapsed)), output.CNone)
+	}
+	line("Duration:", elapsed.String(), output.CNone)
 	fmt.Println(bot)
 }
 

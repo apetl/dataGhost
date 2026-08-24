@@ -23,6 +23,22 @@ func (s *StringSlice) Set(value string) error {
 	return nil
 }
 
+// CountFlag is a flag.Value that counts repeated occurrences (e.g. -v -v).
+type CountFlag int
+
+func (c *CountFlag) String() string {
+	return fmt.Sprintf("%d", int(*c))
+}
+
+func (c *CountFlag) Set(string) error {
+	*c++
+	return nil
+}
+
+// IsBoolFlag lets -v be used without a value; without it the flag package
+// would consume the following argument (e.g. the command name) as the value.
+func (c *CountFlag) IsBoolFlag() bool { return true }
+
 // Config represents configuration settings from a .ghostconf file.
 type Config struct {
 	Ignore       []string `yaml:"ignore"`

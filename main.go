@@ -7,12 +7,19 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"dataGhost/internal/app"
+	"dataGhost/internal/completion"
 	"dataGhost/internal/config"
 	"dataGhost/internal/output"
 )
+
+var commands = []string{
+	"add", "del", "check", "clean", "update", "list", "init",
+	"version", "help", "completion",
+}
 
 func isFlagSet(name string) bool {
 	found := false
@@ -24,9 +31,53 @@ func isFlagSet(name string) bool {
 	return found
 }
 
-func main() {
-	output.InitColors()
+// valueFlags are flags that consume the following token as their value.
+var valueFlags = map[string]bool{
+	"p": true, "cf": true, "csf": true, "i": true, "color": true,
+}
 
+// hoistFlags reorders args so every flag token precedes positional args.
+// Go's flag package stops parsing at the first positional, so
+// `dataGhost check -qc path` would otherwise treat -qc as the path. We move
+// flags ahead of positionals while preserving flag order and value pairings.
+// A "--" terminator forces the rest to be positional.
+func hoistFlags(args []string) []string {
+	var flags, positionals []string
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if a == "--" {
+			positionals = append(positionals, args[i+1:]...)
+			break
+		}
+		if strings.HasPrefix(a, "-") && a != "-" {
+			name := strings.TrimLeft(a, "-")
+			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				name = name[:eq]
+				flags = append(flags, a)
+				i++
+				continue
+			}
+			flags = append(flags, a)
+			// Value-taking flag whose next token is not itself a flag: pull
+			// it along so the pair stays together.
+			if valueFlags[name] && i+1 < len(args) {
+				if next := args[i+1]; next != "--" && !strings.HasPrefix(next, "-") {
+					flags = append(flags, next)
+					i += 2
+					continue
+				}
+			}
+			i++
+			continue
+		}
+		positionals = append(positionals, a)
+		i++
+	}
+	return append(flags, positionals...)
+}
+
+func main() {
 	var (
 		useConfig        bool
 		useStrictConfig  bool
@@ -39,6 +90,10 @@ func main() {
 		quickCheck       bool
 		dryRun           bool
 		jsonOutput       bool
+		rawBytes         bool
+		colorMode        string
+		verbose          config.CountFlag
+		vv               bool
 		ignorePatterns   config.StringSlice
 	)
 	flag.BoolVar(&useConfig, "c", false, "Load .ghostconf from target directory")
@@ -52,8 +107,19 @@ func main() {
 	flag.BoolVar(&quickCheck, "qc", false, "Quick check")
 	flag.BoolVar(&dryRun, "d", false, "Dry run: show what would happen without writing")
 	flag.BoolVar(&jsonOutput, "json", false, "Output results as JSON lines")
+	flag.BoolVar(&rawBytes, "b", false, "Raw byte sizes in list output")
+	flag.StringVar(&colorMode, "color", "auto", "Color output: auto, always, never")
+	flag.Var(&verbose, "v", "Verbose output (repeatable)")
+	flag.BoolVar(&vv, "vv", false, "Very verbose output (same as -v -v)")
 	flag.Var(&ignorePatterns, "i", "Ignore pattern (can be used multiple times)")
-	flag.Parse()
+	flag.CommandLine.Parse(hoistFlags(os.Args[1:]))
+
+	mode, err := output.ParseColorMode(colorMode)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(2)
+	}
+	output.Configure(mode)
 
 	if flag.NArg() < 1 {
 		output.Help()
@@ -61,9 +127,56 @@ func main() {
 	}
 	command := flag.Arg(0)
 
-	// Handle version command specially (no path required).
-	if command == "version" {
+	// Commands that do not require a path argument.
+	switch command {
+	case "version":
 		fmt.Printf("dataGhost %s\n", output.AppVersion)
+		os.Exit(0)
+	case "help":
+		output.Help()
+		os.Exit(0)
+	case "completion":
+		if flag.NArg() < 2 {
+			fmt.Fprintf(os.Stderr, "usage: dataGhost completion bash|zsh|fish|powershell\n")
+			os.Exit(2)
+		}
+		script, err := completion.Script(flag.Arg(1))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(2)
+		}
+		fmt.Print(script)
+		os.Exit(0)
+	}
+
+	a := app.NewApp()
+	a.AlwaysRehash = !isFlagSet("qc")
+	a.DryRun = dryRun
+	a.JSONOutput = jsonOutput
+	a.RawBytes = rawBytes
+	a.Verbosity = int(verbose)
+	if vv {
+		a.Verbosity += 2
+	}
+
+	// JSON mode implies quiet for terminal output.
+	if a.JSONOutput {
+		a.Config.Quiet = true
+		a.Config.ShowProgress = false
+	}
+
+	if command == "init" {
+		dir := "."
+		if flag.NArg() >= 2 {
+			dir = flag.Arg(1)
+		}
+		if isFlagSet("f") {
+			a.Config.Force = forceOverwrite
+		}
+		if err := a.InitConfig(dir); err != nil {
+			fmt.Fprintf(os.Stderr, "%s %v\n", output.TagFatal.String(), err)
+			os.Exit(2)
+		}
 		os.Exit(0)
 	}
 
@@ -73,17 +186,6 @@ func main() {
 	}
 	path := flag.Arg(1)
 
-	a := app.NewApp()
-	a.AlwaysRehash = !isFlagSet("qc")
-	a.DryRun = dryRun
-	a.JSONOutput = jsonOutput
-
-	// JSON mode implies quiet for terminal output.
-	if a.JSONOutput {
-		a.Config.Quiet = true
-		a.Config.ShowProgress = false
-	}
-
 	useAnyConfig := useConfig || useStrictConfig || configFile != "" || strictConfigFile != ""
 	isStrict := useStrictConfig || strictConfigFile != ""
 	finalCF := strictConfigFile
@@ -92,7 +194,7 @@ func main() {
 	}
 
 	if err := a.LoadConfig(finalCF, path, useAnyConfig, isStrict); err != nil {
-		fmt.Printf("%s[FATAL]%s Failed to load config: %v\n", output.ColorRed, output.ColorReset, err)
+		fmt.Fprintf(os.Stderr, "%s Failed to load config: %v\n", output.TagFatal.String(), err)
 		os.Exit(2)
 	}
 
@@ -103,7 +205,7 @@ func main() {
 
 	if isFlagSet("p") {
 		if parallelism < 1 {
-			fmt.Printf("%s[FATAL]%s Parallelism must be >= 1, got %d\n", output.ColorRed, output.ColorReset, parallelism)
+			fmt.Fprintf(os.Stderr, "%s Parallelism must be >= 1, got %d\n", output.TagFatal.String(), parallelism)
 			os.Exit(2)
 		}
 		a.Config.Parallel = parallelism
@@ -134,7 +236,7 @@ func main() {
 			if a.JSONOutput {
 				a.JSONLog(map[string]any{"event": "warning", "message": "Quick check mode: does NOT detect bit rot."})
 			} else {
-				fmt.Printf("%s[WARNING]%s Quick check mode: does NOT detect bit rot.\n", output.ColorYellow, output.ColorReset)
+				a.Logt(output.TagWarning, "Quick check mode: does NOT detect bit rot.\n")
 			}
 		}
 		opErr = a.ProcessFiles(ctx, path, recursive,
@@ -146,16 +248,20 @@ func main() {
 	case "list":
 		opErr = a.ListGhosts(path, recursive)
 	default:
-		fmt.Printf("%s[ERROR]%s Unknown command: %s\n", output.ColorRed, output.ColorReset, command)
-		output.Help()
+		fmt.Fprintf(os.Stderr, "%s Unknown command: '%s'\n", output.TagError.String(), command)
+		if s := output.SuggestCommand(command, commands); s != "" {
+			fmt.Fprintf(os.Stderr, "  Did you mean '%s'?\n", s)
+		}
+		fmt.Fprintln(os.Stderr, "Run 'dataGhost help' for usage.")
 		os.Exit(2)
 	}
 
-	if ctx.Err() != nil {
+	interrupted := ctx.Err() != nil
+	if interrupted {
 		if a.JSONOutput {
 			a.JSONLog(map[string]any{"event": "interrupted", "message": "Operation cancelled."})
 		} else {
-			fmt.Printf("\n%s[INTERRUPTED]%s Operation cancelled.\n", output.ColorYellow, output.ColorReset)
+			a.Logt(output.TagInterrupted, "Operation cancelled.\n")
 		}
 	}
 
@@ -163,17 +269,20 @@ func main() {
 		if a.JSONOutput {
 			a.JSONLog(map[string]any{"event": "fatal", "error": opErr.Error()})
 		} else {
-			fmt.Printf("%s[FATAL]%s %v\n", output.ColorRed, output.ColorReset, opErr)
+			fmt.Fprintf(os.Stderr, "%s %v\n", output.TagFatal.String(), opErr)
 		}
 		os.Exit(2)
 	}
 
-	if command != "list" && (!a.Config.Quiet || a.JSONOutput) {
-		a.PrintSummary()
+	if command != "list" {
+		a.PrintSummary(command, interrupted)
 	}
 
 	exitCode := 0
 	if a.Stats.Corrupted.Load() > 0 {
+		exitCode = 1
+	}
+	if a.Stats.Missing.Load() > 0 && command == "check" {
 		exitCode = 1
 	}
 	if a.Stats.Modified.Load() > 0 && command == "add" {
