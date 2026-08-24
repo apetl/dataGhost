@@ -32,6 +32,7 @@ release:
   github:
     owner: apetl
     name: dataGhost
+    token: "{{ .Env.RELEASE_GITHUB_TOKEN }}"
   draft: true
   prerelease: auto
   name_template: '{{ .Date.Format "2006-01-02" }} ({{ .ShortCommit }})'
