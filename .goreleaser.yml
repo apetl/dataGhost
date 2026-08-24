@@ -34,6 +34,7 @@ release:
     name: dataGhost
   draft: true
   prerelease: auto
+  name_template: '{{ .Date.Format "2006-01-02" }} ({{ .ShortCommit }})'
 
 changelog:
   use: github
