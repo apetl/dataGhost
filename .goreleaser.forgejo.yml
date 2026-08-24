@@ -41,7 +41,7 @@ gitea_urls:
   download: https://git.apetl.com
 
 changelog:
-  use: gitea
+  use: git
   sort: asc
   filters:
     exclude:
