@@ -34,7 +34,7 @@ release:
     name: dataGhost
   draft: true
   prerelease: auto
-  name_template: '{{ .Date.Format "2006-01-02" }} ({{ .ShortCommit }})'
+  name_template: '{{ .Now.Format "2006-01-02" }} ({{ .ShortCommit }})'
 
 gitea_urls:
   api: https://git.apetl.com/api/v1
