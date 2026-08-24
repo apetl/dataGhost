@@ -29,7 +29,7 @@ checksum:
   name_template: 'checksums.txt'
 
 release:
-  github:
+  gitea:
     owner: apetl
     name: dataGhost
   draft: true
@@ -41,7 +41,7 @@ gitea_urls:
   download: https://git.apetl.com
 
 changelog:
-  use: github
+  use: gitea
   sort: asc
   filters:
     exclude:
